@@ -2,11 +2,15 @@ namespace GcodeViewer.Parsing;
 
 /// <summary>
 /// 提前出丝(Advance)的实际生效统计：按材料 A(T0)/B(T1) 汇总每次切换的实际提前量，
-/// 用于回显设定值与实际范围、初始段不足的限幅次数、保留段长的额外前移次数。
+/// 用于回显设定值与实际范围、保留段长的额外前移次数及起点前补偿长度。
 /// 由 AdvancePlanner 在每次切换处累加(Record)，跨层共享同一实例。
 /// </summary>
 public sealed class AdvanceStats
 {
+    /// <summary>各层在原始起点前补偿的路径长度总和(mm)。</summary>
+    public double StartCompensationLength { get; set; }
+    public int CompensatedLayerCount { get; set; }
+
     /// <summary>材料 A(T0) 切换次数。</summary>
     public int SwitchCount0 { get; set; }
 

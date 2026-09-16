@@ -355,9 +355,9 @@ public sealed partial class PathGeneratorForm : Form
             File.WriteAllLines(sfd.FileName, lines, System.Text.Encoding.UTF8);
 
             int t0 = processed.Count(p => p.Tool == 0), t1 = processed.Count(p => p.Tool == 1);
-            // 变速区域跨越切换点折线渐变（切换点速度=vc，两端线性衔接材料正常速度），仅勾选"切换变速"时显示
+            // 变速从实际提前切换点开始，前后各 5% 线性衔接正常速度。
             string speedRange = _chkVelochange.Checked
-                ? "\r\n变速跨越切换点折线渐变：切换点速度 A/B " + vc0.ToString("F1") + "/" + vc1.ToString("F1") + " mm/s，切换距离 A/B " + dc0.ToString("F2") + "/" + dc1.ToString("F2") + " mm（两端线性衔接材料正常速度，全程无突变）"
+                ? "\r\n变速从实际提前切换点开始：过渡速度 A/B " + vc0.ToString("F1") + "/" + vc1.ToString("F1") + " mm/s，设定变速距离 A/B " + dc0.ToString("F2") + "/" + dc1.ToString("F2") + " mm（前5%到达过渡速度，中间90%保持，后5%恢复新材料打印速度；实际距离受提前量和下一切换点限制）"
                 : "";
             MessageBox.Show(this,
                 "CSV 已保存到：" + sfd.FileName +
@@ -380,7 +380,7 @@ public sealed partial class PathGeneratorForm : Form
         }
     }
 
-    /// <summary>回显实际提前量范围、初始段不足导致的限幅及保段长导致的前移次数。</summary>
+    /// <summary>回显实际提前量范围、保段长导致的前移次数及首段补偿长度。</summary>
     private static string FmtAdvanceActual(AdvanceStats s)
     {
         string One(int cnt, double min, double max, int clamped, int extended)
@@ -389,12 +389,13 @@ public sealed partial class PathGeneratorForm : Form
             string mn = double.IsInfinity(min) ? "—" : min.ToString("F2");
             if (max - min > PathGenerator.PathEps) mn += "~" + max.ToString("F2");
             var notes = new List<string>();
-            if (clamped > 0) notes.Add($"初始段不足，限幅{clamped}/{cnt}");
+            if (clamped > 0) notes.Add($"限幅{clamped}/{cnt}");
             if (extended > 0) notes.Add($"保段长前移{extended}/{cnt}");
             return mn + "(" + (notes.Count == 0 ? "未调整" : string.Join("；", notes)) + ")";
         }
         return "\r\n实际提前量 A/B：" + One(s.SwitchCount0, s.MinActual0, s.MaxActual0, s.ClampedCount0, s.ExtendedCount0)
-                                     + " / " + One(s.SwitchCount1, s.MinActual1, s.MaxActual1, s.ClampedCount1, s.ExtendedCount1) + " mm";
+                                     + " / " + One(s.SwitchCount1, s.MinActual1, s.MaxActual1, s.ClampedCount1, s.ExtendedCount1) + " mm"
+                                     + $"\r\n首段起点前补偿：{s.CompensatedLayerCount} 层，累计 {s.StartCompensationLength:F2} mm（各材料段不缩短）";
     }
 
 

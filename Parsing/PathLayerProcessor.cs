@@ -17,7 +17,7 @@ internal static class PathLayerProcessor
 
     /// <summary>
     /// 单层处理编排：偏移 → zones → 关键点 → 段步长 → 插值 → 过滤，返回该层结果点集。
-    /// 行为与原 DirectGeneratePath 单层循环体逐行对应。
+    /// 提前量和变速区共享切换规划，首段在起点前补偿。
     /// </summary>
     public static List<Point3D> ProcessLayer(List<Point3D> inLayer, PathGenParams p, AdvanceStats? stats = null)
     {
@@ -25,8 +25,9 @@ internal static class PathLayerProcessor
         if (inLayer == null || inLayer.Count == 0) return empty;
 
         // 1) 应用提前距离 Tool 偏移（A/B 各自提前量）
-        var transitions = AdvancePlanner.Build(inLayer, p.AdvanceDis0, p.AdvanceDis1, stats);
-        List<Point3D> offsetPoints = PathGenerator.ApplyAdvanceToolOffset(inLayer, transitions);
+        var plan = AdvancePlanner.Prepare(inLayer, p.AdvanceDis0, p.AdvanceDis1, stats);
+        var transitions = plan.Transitions;
+        List<Point3D> offsetPoints = PathGenerator.ApplyAdvanceToolOffset(plan.Points, transitions);
         // 偏移后不足 2 点：直接作为本层结果(原逻辑短路)
         if (offsetPoints.Count < 2) return offsetPoints;
 
@@ -36,7 +37,7 @@ internal static class PathLayerProcessor
         double[] cumulOff = ComputeCumulativeArc(offsetPoints);
         double totalOffArc = cumulOff[nOff - 1];
 
-        // 2b) 变速区域：跨越切换点的 [zStart, zEnd] 范围内速度按折线渐变
+        // 2b) 变速区域：从实际提前切换点开始，速度按 5% / 90% / 5% 折线渐变
         List<SpeedZone> zones = BuildSpeedZones(transitions, p);
 
         // 2c-2d) 关键弧长位置 + 关键点坐标（线性插值）
@@ -105,7 +106,7 @@ internal static class PathLayerProcessor
             double zStart = advS;                    // 变速开始 = 实际提前点(提前区起点)
             double zEnd = advS + changeLength;       // 变速结束
 
-            double rampLength = changeLength * 0.15;
+            double rampLength = changeLength * 0.05;
             double zRampEnd = zStart + rampLength;   // 到达切换速度
             double zHoldEnd = zEnd - rampLength;     // 保持切换速度结束
 
@@ -141,7 +142,7 @@ internal static class PathLayerProcessor
     {
         int nOff = offsetPoints.Count;
 
-        // 2c) 关键弧长位置（原始顶点 + 变速区域两端；切换点 zEnd 已作为原始顶点在上方加入）
+        // 2c) 关键弧长位置（原始顶点 + 变速区起点、5%和95%折点、终点）
         var keyArcs = new List<(double arc, bool isToolSwitch, int toolVal)>();
         for (int i = 0; i < nOff; i++)
         {
@@ -150,7 +151,7 @@ internal static class PathLayerProcessor
         }
         foreach (var z in zones)
         {
-            if (z.ZStart > PathEps && z.ZStart < totalOffArc - PathEps)
+            if (z.ZStart >= 0 && z.ZStart < totalOffArc - PathEps)
             {
                 // 这里已经提前切换，所以使用新 Tool
                 keyArcs.Add((z.ZStart, false, z.ToolNew));
@@ -159,7 +160,7 @@ internal static class PathLayerProcessor
             }
             if (z.ZEnd > PathEps && z.ZEnd < totalOffArc - PathEps)
             {
-                // 保留原始切换点
+                // 保留变速区结束点
                 keyArcs.Add((z.ZEnd, false, z.ToolNew));
             }
         }
@@ -348,10 +349,14 @@ internal static class PathLayerProcessor
             switchRegionMap.Add((swRegStart, layerInterpolated.Count, swRegStep));
 
         // 补上最后一个关键点
-        Point3D lastKey = keyPts[kN - 1];
+        Point3D lastKey = PathGenerator.ClonePoint(keyPts[kN - 1]);
+        lastKey.Feed = lastKey.Tool == 0 ? p.Velo0 : p.Velo1;
         if (layerInterpolated.Count == 0
             || layerInterpolated[layerInterpolated.Count - 1].DistanceTo(lastKey) > PathEps)
             layerInterpolated.Add(lastKey);
+        else
+            // 终点恰好为变速区结束时，也必须写入恢复后的正常速度。
+            layerInterpolated[^1] = lastKey;
 
         return (layerInterpolated, switchRegionMap);
     }
@@ -430,9 +435,9 @@ internal static class PathLayerProcessor
     // ====================== 变速区域速度与插值(自 PathGenerator 搬入) ======================
 
     /// <summary>
-    /// 跨越切换点的变速区域 [zStart, zEnd] 内弧长 s 处的折线渐变速度(匀速变化、全程无突变)。
+    /// 从实际切换点开始的变速区域 [zStart, zEnd] 内弧长 s 处的折线渐变速度。
     /// [zStart, zRampEnd]：VeloOld 线性渐变到 Vc；[zRampEnd, zHoldEnd]：保持 Vc；
-    /// [zHoldEnd, zEnd]：Vc 线性渐变到 VeloNew。切换点处速度恰好为 Vc，与两端正常段连续。
+    /// [zHoldEnd, zEnd]：Vc 线性渐变到 VeloNew。前 5% 到达 Vc，后 5% 恢复新材料正常速度。
     /// 渐变速率由变速距离与速度差共同决定——变速距离越大变化越平缓。
     /// </summary>
     private static double SpeedAtBridge(double s, double zStart, double zRampEnd, double zHoldEnd, double zEnd,
@@ -457,7 +462,7 @@ internal static class PathLayerProcessor
     }
 
     /// <summary>
-    /// 跨越切换点的变速区域内的变步长插值：沿段 [a, b](弧长 [sA, sB])按折线速度曲线推进。
+    /// 变速区域内的变步长插值：沿段 [a, b](弧长 [sA, sB])按折线速度曲线推进。
     /// 每步步长 = 当前弧长处的渐变速度 × dt，点距随速度匀速变化(速度快处点疏、慢处点密)。
     /// 每个生成点的 Feed 写入该步渐变速度；Tool 取新材料。
     /// </summary>

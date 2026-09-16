@@ -685,7 +685,7 @@ public static class PathGenerator
     /// 对路径点集施加提前出丝距离偏移（Advance Tool Offset）。
     /// 在 Tool 切换边界处提前切换材料，补偿挤出滞后。
     /// 自 AMCP.FrmPrintStep2.ApplyAdvanceToolOffset 移植，并扩展为按"切入材料"分别设置提前距离。
-    /// 后续材料段不缩短：所需提前量向前传播，仅初始段可压缩；初始段不足时限幅。
+    /// 各材料段不缩短：所需提前量向前传播，并沿首段反方向补偿初始材料长度。
     /// </summary>
     /// <param name="points">原始路径点集（Tool 值已映射）</param>
     /// <param name="advanceDis0">切入材料 A(T0) 时所用提前出丝距离(mm)——即 B→A 切换的提前量</param>
@@ -694,7 +694,8 @@ public static class PathGenerator
     public static List<Point3D> ApplyAdvanceToolOffset(List<Point3D> points, double advanceDis0, double advanceDis1, AdvanceStats? stats = null)
     {
         if (points == null || points.Count == 0) return new List<Point3D>();
-        return ApplyAdvanceToolOffset(points, AdvancePlanner.Build(points, advanceDis0, advanceDis1, stats));
+        var plan = AdvancePlanner.Prepare(points, advanceDis0, advanceDis1, stats);
+        return ApplyAdvanceToolOffset(plan.Points, plan.Transitions);
     }
 
     internal static List<Point3D> ApplyAdvanceToolOffset(List<Point3D> points,
@@ -717,7 +718,7 @@ public static class PathGenerator
             return result;
         }
 
-        // 2. 使用统一规划的切换事件；顺序不变，压缩只传递到初始段。
+        // 2. 使用统一规划的切换事件；顺序不变，初始段已有前置补偿。
         // 3. 关键弧长位置 = 原始点 + 提前点，排序去重
         var positions = new List<double>(cumul);
         foreach (var t in transitions)
@@ -899,7 +900,7 @@ public static class PathGenerator
     /// <param name="disChange1">T1 变速距离(mm)</param>
     /// <param name="dt">等时间采样周期(s，默认 0.02=50Hz)。各材料步长 = 速度 × dt，决定插值密度与密度过滤阈值。
     ///   与 StatsPanel 的 numdt 统一：dt 越小点越密、回放速度越贴近设计速度。</param>
-    /// <param name="enableVeloChange">是否启用跨越切换点的变速规则。</param>
+    /// <param name="enableVeloChange">是否启用从实际提前切换点开始的 5% / 90% / 5% 变速规则。</param>
     /// <returns>处理后的路径点集</returns>
     public static List<Point3D> DirectGeneratePath(List<Point3D> points,
         double advanceDis0, double advanceDis1, double velo0, double velo1,

@@ -39,7 +39,7 @@ internal sealed class PathGenParams
     /// <summary>等时间采样周期(s，默认 0.02=50Hz)。各材料步长 = 速度 × dt。</summary>
     public double Dt { get; set; }
 
-    /// <summary>是否启用变速规则(跨越切换点的折线渐变)。</summary>
+    /// <summary>是否启用实际提前切换点开始的 5% / 90% / 5% 折线变速。</summary>
     public bool EnableVeloChange { get; set; }
 
     /// <summary>材料 A(T0) 步长 = Velo0 × Dt。</summary>
@@ -71,7 +71,7 @@ internal sealed class PathGenParams
 }
 
 /// <summary>
-/// 跨越切换点的变速区域（替代原匿名 ValueTuple，提升可读性）。
+/// 从实际提前切换点开始的变速区域（替代原匿名 ValueTuple）。
 /// 区域 [ZStart, ZEnd] 锚定在提前区起点(实际提前点 advS)：ZStart=advS，ZEnd=advS+changeLength。
 /// [ZStart, ZRampEnd] 速度由 VeloOld 渐变到 Vc，[ZRampEnd, ZHoldEnd] 保持 Vc，[ZHoldEnd, ZEnd] 由 Vc 渐变到 VeloNew。
 /// </summary>
