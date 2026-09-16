@@ -32,12 +32,16 @@ public sealed partial class MainForm : Form
         _statsPanel.ChangeTypeRequested += OnChangeType;
         _statsPanel.CoordChangeRequested += OnCoordChange;
         _statsPanel.UndoRequested += () => Undo();
-        _statsPanel.ColorModeChanged += (byTool, byLayer) =>
+        _statsPanel.ColorModeChanged += (byTool, byLayer, bySpeed) =>
         {
             _viewport.ColorByTool = byTool;
             _viewport.ColorByLayer = byLayer;
+            _viewport.ColorBySpeed = bySpeed;
             _viewport.Invalidate();
         };
+        // 采样周期 dt 变化：同步视口并重算速度着色范围（ColorBySpeed 时生效）
+        _statsPanel.SamplePeriodChanged += () => _viewport.SpeedSamplePeriod = _statsPanel.SamplePeriodSeconds;
+        _viewport.SpeedSamplePeriod = _statsPanel.SamplePeriodSeconds;   // 初始同步一次（默认 0.02s）
         _statsPanel.ShowToolChanged += v => { _viewport.ShowToolChange = v; _viewport.Invalidate(); };
         _statsPanel.ShowModifiedChanged += v => { _viewport.ShowModified = v; _viewport.Invalidate(); };
         _statsPanel.FilterLayerChanged += layer =>
@@ -64,6 +68,9 @@ public sealed partial class MainForm : Form
         _miTopView.Click += (s, e) => _viewport.TopView();
         _miEvalCompare.Click += (s, e) => OpenEvaluation();
         _miPathGen.Click += (s, e) => OpenPathGenerator();
+        var miCfs = new ToolStripMenuItem("CFS 螺旋线生成…") { Name = "_miCfsGenerate" };
+        _miGenerate.DropDownItems.Add(miCfs);
+        miCfs.Click += (s, e) => OpenCfsGenerator();
         _miBigData.Click += (s, e) => OpenBigDataForm();
         _miVoxelGen.Click += (s, e) => OpenVoxelGenerator();
         _miLineWidth.Click += (s, e) => OpenLineWidthForm();
@@ -133,7 +140,7 @@ public sealed partial class MainForm : Form
     {
         if (!ConfirmDiscard()) return;
         
-        using var dlg = new OpenFileDialog { Filter = "路径 CSV|*.csv|G-code|*.gcode;*.g;*.nc;*.tap|所有文件|*.*" };
+        using var dlg = new OpenFileDialog { Filter = "路径 CSV;G-code|*.csv;*.gcode;*.g;*.nc;*.tap|所有文件|*.*" };
         if (dlg.ShowDialog() != DialogResult.OK) return;
         OpenPath(dlg.FileName);
     }
@@ -166,11 +173,13 @@ public sealed partial class MainForm : Form
         _undoStack.Clear();
         PopulateAll();
         _viewport.SetGcode(_gcode);
-        _statsPanel.SetLayerRange(_gcode.Stats.Layers.Count > 0 ? _gcode.Stats.Layers.Max(l => l.Layer) : 0);
+        _statsPanel.SetLayerRange(
+            _gcode.Stats.Layers.Count > 0 ? _gcode.Stats.Layers.Max(l => l.Layer) : 0,
+            _gcode.IsZLayered ? _gcode.LayerZMap : null);
 
         // 无层信息（源文件无 ;LAYER 注释）：无法按层识别，强制按材料(T0/T1)显示
         if (!_gcode.HasLayerInfo)
-            _statsPanel.SetColorMode(byTool: true, byLayer: false);
+            _statsPanel.SetColorMode(byTool: false, byLayer: false, bySpeed: false);
 
         UpdateStatus();
     }
@@ -179,6 +188,11 @@ public sealed partial class MainForm : Form
     public void LoadExternal(ParsedGcode g, string displayName) => LoadParsed(g, displayName);
 
     /// <summary>打开路径生成窗体（G-code→RDP 简化→CSV 导出），非模态，可与主窗口并存。</summary>
+    private void OpenCfsGenerator()
+    {
+        using var dialog = new CfsGenerateForm();
+        dialog.ShowDialog(this);
+    }
     private void OpenPathGenerator()
     {
         var form = new PathGeneratorForm(this) { Owner = this };
@@ -228,7 +242,7 @@ public sealed partial class MainForm : Form
         }
     }
 
-    /// <summary>导出当前路径为密集点 CSV（G0/G1 统一按各行速度 V×采样周期弧长等步长采样 + 近重点滤波，保证回放速度=设计速度），由右侧面板触发。</summary>
+    /// <summary>导出当前路径为密集点 CSV（G0/G1 按各行速度 V×采样周期固定步长采样 + 段尾余数合并/近零长段跳过 + 近重点滤波，相邻点距∈[0.5V·T,1.5V·T]、回放速度≈设计速度），由右侧面板触发。</summary>
     private void OnStatsExportCsv(double samplePeriod)
     {
         if (_gcode == null || _gcode.IsEmpty)
@@ -248,8 +262,9 @@ public sealed partial class MainForm : Form
             int count = StatsPanel.ExportMovesCsv(_gcode, samplePeriod, sfd.FileName);
             MessageBox.Show(
                 $"已导出 {count} 个采样点到：\n{sfd.FileName}\n" +
-                $"（G0/G1 统一按各行速度 V×{samplePeriod:0.###}s 弧长等步长采样，相邻点距 = V·T → 回放速度 = 设计速度；" +
-                $"V 缺失按 1mm 兜底；已剔除近重合冗余点，段终点保留）", "完成");
+                $"（7 列：X,Y,Z,G0/G1,T,P,Speed；按各行速度 V×{samplePeriod:0.###}s 固定步长采样，末列携带真实速度）\n" +
+                $"按速度着色将直接读 Speed 列，不再用点距反推，无 0/0.5 伪影。\n" +
+                $"V 缺失按 1mm 兜底；已剔除近重合冗余点，段终点保留", "完成");
         }
         catch (Exception ex)
         {
@@ -303,10 +318,11 @@ public sealed partial class MainForm : Form
 
         _layerList.BeginUpdate();
         _layerList.Items.Clear();
+        bool zLayered = _gcode.IsZLayered;
         // 列头只建一次（Designer 未定义）；末列为 G0/G1 切换次数
         if (_layerList.Columns.Count == 0)
         {
-            _layerList.Columns.Add("层", 36);
+            _layerList.Columns.Add("层", 52);
             _layerList.Columns.Add("起始行", 52);
             _layerList.Columns.Add("结束行", 52);
             _layerList.Columns.Add("G1长 mm", 62);
@@ -314,14 +330,19 @@ public sealed partial class MainForm : Form
             _layerList.Columns.Add("换刀", 44);
             _layerList.Columns.Add("G0/G1切换", 70);
         }
+        // CSV 按 Z 分层时首列用 Z 值标识层（Tag 仍存层号，供过滤/选中）
+        _layerList.Columns[0].Text = zLayered ? "Z层" : "层";
         foreach (var l in _gcode.Stats.Layers)
+        {
+            string layerLabel = zLayered ? l.Z.ToString("0.###") : l.Layer.ToString();
             _layerList.Items.Add(new ListViewItem(new[]
             {
-                l.Layer.ToString(), l.StartLine.ToString(), l.EndLine.ToString(),
+                layerLabel, l.StartLine.ToString(), l.EndLine.ToString(),
                 l.G1Length.ToString("0.###"), l.G0Length.ToString("0.###"), l.ToolChangeCount.ToString(),
                 l.G0G1SwitchCount.ToString(),
             })
             { Tag = l.Layer });
+        }
         _layerList.EndUpdate();
 
         _switchList.BeginUpdate();
@@ -488,7 +509,13 @@ public sealed partial class MainForm : Form
         string dirty = _dirty ? " ●未保存" : "";
         string file = string.IsNullOrEmpty(_currentFile) ? "(未打开)" : Path.GetFileName(_currentFile);
         string sel = _selectedMoveIndex >= 0 ? $" | 选中 move #{_selectedMoveIndex}" : "";
-        string layer = _gcode != null && !_gcode.HasLayerInfo ? " | ⚠ 路径无法识别(无层信息)，已按材料 T0/T1 显示" : "";
+        string layer = _gcode switch
+        {
+            null => "",
+            _ when !_gcode.HasLayerInfo => " | ⚠ 路径无法识别(无层信息)，已按材料 T0/T1 显示",
+            _ when _gcode.IsZLayered => $" | CSV 按 Z 分层（{_gcode.Stats.LayerCount} 层）",
+            _ => "",
+        };
         _statusBar.Text = $"文件: {file}{dirty} | 撤销栈: {_undoStack.Count}{sel}{layer}";
     }
     public string CurrentFile => _currentFile;
@@ -499,3 +526,4 @@ public sealed partial class MainForm : Form
         Open();
     }
 }
+

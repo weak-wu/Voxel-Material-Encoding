@@ -103,13 +103,13 @@ public sealed partial class MainForm
         _miTopView = new ToolStripMenuItem();
         _miEvaluate = new ToolStripMenuItem();
         _miEvalCompare = new ToolStripMenuItem();
+        _miLineWidth = new ToolStripMenuItem();
         _miGenerate = new ToolStripMenuItem();
         _miPathGen = new ToolStripMenuItem();
         _miBigData = new ToolStripMenuItem();
         _miVoxelGen = new ToolStripMenuItem();
         _miHelp = new ToolStripMenuItem();
         _miAbout = new ToolStripMenuItem();
-        _miLineWidth = new ToolStripMenuItem();
         ((System.ComponentModel.ISupportInitialize)_splitOuter).BeginInit();
         _splitOuter.Panel1.SuspendLayout();
         _splitOuter.Panel2.SuspendLayout();
@@ -262,7 +262,8 @@ public sealed partial class MainForm
         // 
         _viewport.BackColor = Color.White;
         _viewport.ColorByLayer = false;
-        _viewport.ColorByTool = true;
+        _viewport.ColorBySpeed = false;
+        _viewport.ColorByTool = false;
         _viewport.Dock = DockStyle.Fill;
         _viewport.FilterLayer = -1;
         _viewport.G0LineWidth = 2F;
@@ -274,6 +275,7 @@ public sealed partial class MainForm
         _viewport.ShowToolChange = true;
         _viewport.ShowVoxel = true;
         _viewport.Size = new Size(302, 396);
+        _viewport.SpeedSamplePeriod = 0.02D;
         _viewport.StlMaxEdges = 24000;
         _viewport.StlWireColor = Color.Silver;
         _viewport.TabIndex = 0;
@@ -307,6 +309,7 @@ public sealed partial class MainForm
         _codeList.FullRowSelect = true;
         _codeList.Location = new Point(0, 173);
         _codeList.Name = "_codeList";
+        _codeList.ShowItemToolTips = true;
         _codeList.Size = new Size(1364, 219);
         _codeList.TabIndex = 0;
         _codeList.UseCompatibleStateImageBehavior = false;
@@ -451,6 +454,12 @@ public sealed partial class MainForm
         _miEvalCompare.Size = new Size(278, 22);
         _miEvalCompare.Text = "路径对比评估…";
         // 
+        // _miLineWidth
+        // 
+        _miLineWidth.Name = "_miLineWidth";
+        _miLineWidth.Size = new Size(278, 22);
+        _miLineWidth.Text = "打印线宽提取（图像→HSV→线宽）…";
+        // 
         // _miGenerate
         // 
         _miGenerate.DropDownItems.AddRange(new ToolStripItem[] { _miPathGen, _miBigData, _miVoxelGen });
@@ -469,9 +478,9 @@ public sealed partial class MainForm
         _miBigData.Name = "_miBigData";
         _miBigData.Size = new Size(272, 22);
         _miBigData.Text = "多组双材料 G-code 生成…";
-        //
+        // 
         // _miVoxelGen
-        //
+        // 
         _miVoxelGen.Name = "_miVoxelGen";
         _miVoxelGen.Size = new Size(272, 22);
         _miVoxelGen.Text = "体素生成器（STL→体素 CSV）…";
@@ -488,12 +497,6 @@ public sealed partial class MainForm
         _miAbout.Name = "_miAbout";
         _miAbout.Size = new Size(100, 22);
         _miAbout.Text = "说明";
-        // 
-        // _miLineWidth
-        // 
-        _miLineWidth.Name = "_miLineWidth";
-        _miLineWidth.Size = new Size(278, 22);
-        _miLineWidth.Text = "打印线宽提取（图像→HSV→线宽）…";
         // 
         // MainForm
         // 

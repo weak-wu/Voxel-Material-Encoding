@@ -65,6 +65,8 @@ public static class StatsCalculator
             if (!layerMap.TryGetValue(m.Layer, out var li))
             {
                 li = new LayerInfo { Layer = m.Layer, StartLine = m.LineNumber };
+                // 代表 Z：CSV 按 Z 分层取层锚点 Z；G-code（LayerZMap 为空）取该层首条 move 的 Z。
+                li.Z = g.LayerZMap.TryGetValue(m.Layer, out double layerZ) ? layerZ : m.Z;
                 layerMap[m.Layer] = li;
             }
             li.EndLine = m.LineNumber;

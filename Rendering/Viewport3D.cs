@@ -19,9 +19,23 @@ public sealed class Viewport3D : UserControl
     // 显示开关
     public bool ColorByTool { get; set; } = true;
     public bool ColorByLayer { get; set; } = false;
+    /// <summary>按速度着色：CSV 等时采样下 点距 Δs=V·dt，故点密度即速度（密=慢→蓝、疏=快→红，Jet 多色）。优先级最高，仅作用于 G1。</summary>
+    public bool ColorBySpeed { get; set; } = false;
     public bool ShowToolChange { get; set; } = true;
     public bool ShowModified { get; set; } = true;
     public int FilterLayer { get; set; } = -1;   // -1 = 全部
+
+    // ---- 按速度着色：采样周期 dt(s) 与全局速度归一化范围 ----
+    private double _speedDt = 0.02;              // 等时间采样周期(默认 50Hz)；CSV 步长=V·dt
+    /// <summary>等时间采样周期 dt(秒)。设值时重算速度范围并重绘。CSV 速度反推 V=SegmentLength/dt。</summary>
+    public double SpeedSamplePeriod
+    {
+        get => _speedDt;
+        set { _speedDt = value; ComputeSpeedRange(); Invalidate(); }
+    }
+    private double _vMin, _vMax, _vRange;        // 全局 G1 段速度的 min/max/范围，用于颜色归一化
+    private double _vMean, _vSlowThr, _vFastThr; // 均值 与 异常阈值(分位数 P5/P95)：标记特别慢/快
+    private double _dvP95;                       // 相邻速度差 Δv 的 P95(突变阈值)：标记速度突变点
 
     // 线宽（像素）：默认加粗，白底截图更清晰，可按需微调
     /// <summary>空行程 G0 虚线线宽。</summary>
@@ -94,6 +108,7 @@ public sealed class Viewport3D : UserControl
     public void SetGcode(ParsedGcode? g)
     {
         _gcode = g;
+        ComputeSpeedRange();   // 新数据：重算速度归一化范围
         ResetView();
         Invalidate();
     }
@@ -105,6 +120,7 @@ public sealed class Viewport3D : UserControl
     public void UpdateData(ParsedGcode? g)
     {
         _gcode = g;
+        ComputeSpeedRange();   // 编辑后数据变化：重算速度范围
         Invalidate();
     }
 
@@ -328,6 +344,58 @@ public sealed class Viewport3D : UserControl
             }
         }
 
+        // 速度异常标记（仅按速度着色时）：v<P5 特别慢=橙方块、v>P95 特别快=青方块（黑描边醒目），
+        // 并在方块旁标注该点速度数值(mm/s)；同类型异常点屏幕距 < textGap 时只标一个，避免文字堆叠
+        if (ColorBySpeed && _vRange > 1e-9)
+        {
+            double dt = _speedDt > 1e-9 ? _speedDt : 0.02;
+            const float textGap = 26f;                  // 同类型数值最小屏幕间距(px)
+            using var txtFont = new Font("Consolas", 7.5F);
+            using var txtBrush = new SolidBrush(Color.Black);
+            PointF? lastSlow = null, lastFast = null;   // 各自记录上一处已标数值的点，用于去重
+            for (int i = 0; i < _gcode.Moves.Count; i++)
+            {
+                if (FilterLayer >= 0 && _gcode.Moves[i].Layer != FilterLayer) continue;
+                var m = _gcode.Moves[i];
+                if (m.Type != MoveType.G1) continue;
+                double v = m.Speed > 0 ? m.Speed : m.SegmentLength / dt;
+                PointF sp = _screenPts[i];
+                // 对比色策略：慢点(蓝区)用暖色橙、快点(红区)用冷色青，黑描边保证任意背景可见
+                if (v < _vSlowThr)
+                {
+                    DrawSpeedMarker(g, sp, Color.Orange);
+                    if (!lastSlow.HasValue || DistSq(sp, lastSlow.Value) >= textGap * textGap)
+                    { g.DrawString($"{v:0.#}", txtFont, txtBrush, sp.X + 5.5f, sp.Y - 12f); lastSlow = sp; }
+                }
+                else if (v > _vFastThr)
+                {
+                    DrawSpeedMarker(g, sp, Color.DeepSkyBlue);
+                    if (!lastFast.HasValue || DistSq(sp, lastFast.Value) >= textGap * textGap)
+                    { g.DrawString($"{v:0.#}", txtFont, txtBrush, sp.X + 5.5f, sp.Y - 12f); lastFast = sp; }
+                }
+            }
+        }
+
+        // 速度突变标记（仅按速度着色时）：相邻点 |Δv| > P95(Δv) → 紫色菱形
+        // （区别于橙/青的绝对值异常；突变反映速度跳变/加减速剧烈处）
+        if (ColorBySpeed && _dvP95 > 1e-9)
+        {
+            double dt = _speedDt > 1e-9 ? _speedDt : 0.02;
+            double prevV = double.NaN;
+            for (int i = 0; i < _gcode.Moves.Count; i++)
+            {
+                // 层过滤：非目标层重置前驱速度(跨层衔接不算突变)
+                if (FilterLayer >= 0 && _gcode.Moves[i].Layer != FilterLayer) { prevV = double.NaN; continue; }
+                var m = _gcode.Moves[i];
+                if (m.Type != MoveType.G1) continue;
+                double v = m.Speed > 0 ? m.Speed : m.SegmentLength / dt;
+                if (!(v > 1e-9)) continue;
+                if (!double.IsNaN(prevV) && Math.Abs(v - prevV) > _dvP95)
+                    DrawJerkMarker(g, _screenPts[i]);
+                prevV = v;
+            }
+        }
+
         // 选中点（白底改用黑色十字+黑环，保证可见）
         if (SelectedMoveIndex >= 0 && SelectedMoveIndex < _screenPts.Count)
         {
@@ -340,6 +408,9 @@ public sealed class Viewport3D : UserControl
 
         // 评估叠加层（偏差热力线 / 体素点云）——叠加在主路径之上
         DrawOverlay(g, center);
+
+        // 按速度着色的色条图例（右下角，标注 vMin~vMax mm/s）
+        if (ColorBySpeed) DrawSpeedLegend(g);
     }
 
     /// <summary>计算 (gcode ∪ STL) 联合包围盒的中心与最大边长；无任何数据时返回 false。</summary>
@@ -503,13 +574,24 @@ public sealed class Viewport3D : UserControl
         // 与 G1 的 T0(蓝)/T1(红) 明确区分（对应"说明"框中"G0=空行程(灰虚线)"）。
         if (m.Type == MoveType.G0) return Color.LightSeaGreen;
 
+        // 按速度着色（最高优先级）：V = Speed>0 ? Speed : SegmentLength/dt
+        if (ColorBySpeed)
+        {
+            double dt = _speedDt > 1e-9 ? _speedDt : 0.02;
+            double v = m.Speed > 0 ? m.Speed : m.SegmentLength / dt;
+            double t = _vRange > 1e-9 ? (v - _vMin) / _vRange : 0.5;
+            t = Math.Clamp(t, 0.0, 1.0);
+            // 多色 Jet 梯度：慢=蓝(hue240°) → 青 → 绿 → 黄 → 快=红(hue0°)，对比鲜明
+            return ColorFromHSV((1.0 - t) * 240.0, 0.9, 0.95);
+        }
+
         if (ColorByLayer)
         {
             // 按 HSV 循环取色
             double hue = (m.Layer * 47.0) % 360.0;
             return ColorFromHSV(hue, 0.85, 0.9);
         }
-        if (!ColorByTool) return Color.LimeGreen;
+        if (!ColorByTool) return Color.Blue;
         //
         return m.Tool switch
         {
@@ -517,6 +599,60 @@ public sealed class Viewport3D : UserControl
             1 => Color.Blue,     // T1=蓝
             _ => Color.LimeGreen,
         };
+    }
+
+    /// <summary>
+    /// 遍历当前 gcode 的 G1 段，按 V = Speed>0 ? Speed : SegmentLength/dt 计算各点速度，
+    /// 取全局 min/max 作为颜色归一化范围，并以分位数 P5/P95 界定速度异常阈值（特别慢/快）。
+    /// 跳过零长/无效点。供 GetColor 速度分支与异常标记使用。在 SetGcode/UpdateData 与
+    /// SpeedSamplePeriod 改变时调用。
+    /// </summary>
+    private void ComputeSpeedRange()
+    {
+        _vMin = 0; _vMax = 0; _vRange = 0;
+        _vMean = 0; _vSlowThr = 0; _vFastThr = 0;
+        _dvP95 = 0;
+        if (_gcode == null || _gcode.Moves.Count == 0) return;
+
+        double dt = _speedDt > 1e-9 ? _speedDt : 0.02;
+        // 收集有效 G1 段速度 vs 与相邻速度差 dvs(基于原始 move 顺序)；排序后取各统计量；都收集
+        var vs = new List<double>();
+        var dvs = new List<double>();
+        double sum = 0;
+        double prevV = double.NaN;
+        foreach (var m in _gcode.Moves)
+        {
+            //if (m.Type != MoveType.G1) continue;
+            double v = m.Speed > 0 ? m.Speed : m.SegmentLength / dt;
+            if (!(v > 1e-9)) continue;          // 跳过零长/无效段
+            vs.Add(v);
+            sum += v;
+            if (!double.IsNaN(prevV)) dvs.Add(Math.Abs(v - prevV));   // 相邻速度差 Δv
+            prevV = v;
+        }
+        if (vs.Count == 0) return;              // 无有效点：保持全 0
+        vs.Sort();
+        _vMin = vs[0];
+        _vMax = vs[^1];
+        _vRange = _vMax - _vMin;
+        _vMean = sum / vs.Count;
+        // 速度绝对值异常阈值(分位数 P5/P95)：最慢 5% 与最快 5%
+        _vSlowThr = Quantile(vs, 0.05);
+        _vFastThr = Quantile(vs, 0.95);
+        // 速度突变阈值：相邻速度差 Δv 的 P95(自适应，约标出最剧烈的 5% 跳变)
+        if (dvs.Count > 0) { dvs.Sort(); _dvP95 = Quantile(dvs, 0.95); }
+    }
+
+    /// <summary>对升序数组按分位数 p∈[0,1] 线性插值取值（P5/P95 异常阈值用）。</summary>
+    private static double Quantile(List<double> sortedAsc, double p)
+    {
+        int n = sortedAsc.Count;
+        if (n == 0) return 0;
+        double idx = p * (n - 1);
+        int lo = (int)Math.Floor(idx);
+        int hi = (int)Math.Ceiling(idx);
+        if (lo == hi) return sortedAsc[lo];
+        return sortedAsc[lo] + (sortedAsc[hi] - sortedAsc[lo]) * (idx - lo);
     }
 
     private static void DrawMarker(Graphics g, PointF p, Color c, float r)
@@ -531,6 +667,38 @@ public sealed class Viewport3D : UserControl
         g.DrawEllipse(pen, p.X - r, p.Y - r, r * 2, r * 2);
     }
 
+    /// <summary>速度异常点标记：实心方块(fill)+黑色描边，在任何 Jet 速度色背景上均醒目。</summary>
+    private static void DrawSpeedMarker(Graphics g, PointF p, Color fill)
+    {
+        const float s = 4.5f;
+        using var b = new SolidBrush(fill);
+        g.FillRectangle(b, p.X - s, p.Y - s, s * 2, s * 2);
+        using var pen = new Pen(Color.Black, 1f);
+        g.DrawRectangle(pen, p.X - s, p.Y - s, s * 2, s * 2);
+    }
+
+    /// <summary>两点屏幕距离平方（免开方，用于异常数值文字的去重判定）。</summary>
+    private static float DistSq(PointF a, PointF b)
+    {
+        float dx = a.X - b.X, dy = a.Y - b.Y;
+        return dx * dx + dy * dy;
+    }
+
+    /// <summary>速度突变点标记：紫色菱形(旋转方块)+黑色描边，区别于橙/青(速度绝对值异常)。</summary>
+    private static void DrawJerkMarker(Graphics g, PointF p)
+    {
+        const float s = 5f;
+        PointF[] pts =
+        {
+            new(p.X, p.Y - s), new(p.X + s, p.Y),
+            new(p.X, p.Y + s), new(p.X - s, p.Y),
+        };
+        using var b = new SolidBrush(Color.MediumPurple);
+        g.FillPolygon(b, pts);
+        using var pen = new Pen(Color.Black, 1f);
+        g.DrawPolygon(pen, pts);
+    }
+
     private void DrawHint(Graphics g, string text)
     {
         // 白底下用深灰文字，保证对比度
@@ -538,6 +706,58 @@ public sealed class Viewport3D : UserControl
         using var f = new Font("Microsoft YaHei UI", 11F);
         var sz = g.MeasureString(text, f);
         g.DrawString(text, f, b, (Width - sz.Width) / 2, (Height - sz.Height) / 2);
+    }
+
+    /// <summary>
+    /// 绘制按速度着色的色条图例（右下角）：竖向 Jet 色条 顶=红(快/vMax) → 底=蓝(慢/vMin)，
+    /// 两端标注速度(mm/s)，并以橙/青横线标出 P5(慢异常)/P95(快异常) 阈值。仅 ColorBySpeed 时调用。
+    /// </summary>
+    private void DrawSpeedLegend(Graphics g)
+    {
+        const float barW = 14f, barH = 160f;
+        const float margin = 12f;
+        float x = Width - barW - margin - 40f;   // 右侧留 40px 给数值文字
+        float y = Height - barH - margin;
+        if (x < 4f) x = 4f;                       // 视口过窄时防溢出
+
+        // 分段填充 Jet 梯度，与 GetColor 一致：底 t=0=蓝(hue240) → 顶 t=1=红(hue0)
+        int steps = 48;
+        float segH = barH / steps;
+        for (int i = 0; i < steps; i++)
+        {
+            double t = (double)(steps - 1 - i) / (steps - 1);   // i=0(顶)→t=1(红)
+            using var b = new SolidBrush(ColorFromHSV((1.0 - t) * 240.0, 0.9, 0.95));
+            g.FillRectangle(b, x, y + i * segH, barW, segH + 1f);   // +1 消除段间缝隙
+        }
+        using var frame = new Pen(Color.DimGray, 0.8f);
+        g.DrawRectangle(frame, x, y, barW, barH);
+
+        var sf = new StringFormat { Alignment = StringAlignment.Near, LineAlignment = StringAlignment.Center };
+        using var f = new Font("Consolas", 8.5F);
+        using var sb = new SolidBrush(Color.FromArgb(70, 70, 70));
+        g.DrawString($"{_vMax:0.#}", f, sb, x + barW + 3f, y, sf);            // 顶端：快
+        g.DrawString($"{_vMin:0.#}", f, sb, x + barW + 3f, y + barH, sf);     // 底端：慢
+        using var fu = new Font("Microsoft YaHei UI", 7.5F);
+        g.DrawString("mm/s", fu, sb, x + barW + 3f, y + barH / 2f, sf);
+
+        // 异常阈值横线：P5(慢,橙)/P95(快,青)，与画面方块标记同色，使图例自洽
+        if (_vRange > 1e-9)
+        {
+            DrawThresholdLine(g, x, y, barW, barH, _vSlowThr, Color.Orange, f);
+            DrawThresholdLine(g, x, y, barW, barH, _vFastThr, Color.DeepSkyBlue, f);
+        }
+    }
+
+    /// <summary>在色条上画一条阈值横线并标注数值（异常阈值刻度，与画面异常标记同色对应）。</summary>
+    private void DrawThresholdLine(Graphics g, float x, float y, float barW, float barH, double v, Color c, Font f)
+    {
+        double t = (v - _vMin) / _vRange;
+        float yy = y + (float)(1.0 - t) * barH;
+        using var pen = new Pen(c, 1.6f);
+        g.DrawLine(pen, x - 3f, yy, x + barW + 3f, yy);
+        using var sb = new SolidBrush(c);
+        var sf = new StringFormat { Alignment = StringAlignment.Near, LineAlignment = StringAlignment.Center };
+        g.DrawString($"{v:0.#}", f, sb, x + barW + 3f, yy, sf);
     }
 
     private static Color ColorFromHSV(double hue, double saturation, double value)

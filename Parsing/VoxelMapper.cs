@@ -155,8 +155,10 @@ public static class VoxelMapper
     /// 按体素数据给原始路径点映射材料值(Tool)：用 DDA 光线投射遍历段间经过的体素单元，
     /// 在材料边界处插入过渡点。自 FrmPrintStep2.AssignTValuesFromVoxelFile 移植。
     /// </summary>
-    public static List<Point3D> AssignTValues(List<Point3D> originalPoints, VoxelData? voxel)
+    public static List<Point3D> AssignTValues(List<Point3D> originalPoints, VoxelData? voxel, bool insertTransitionalPoints , out int switchesBefore, out int switchesAfter)
     {
+        switchesBefore = 0;
+        switchesAfter = 0;
         var assigned = new List<Point3D>();
         if (originalPoints == null || originalPoints.Count == 0
             || voxel == null || voxel.Matrix.Count == 0)
@@ -202,6 +204,19 @@ public static class VoxelMapper
         };
 
         // 3. 逐段映射，体素边界插入过渡点
+        var vertexDepths = new List<int>(originalPoints.Count);
+        for (int i = 0; i < originalPoints.Count; i++)
+        {
+            var p = originalPoints[i];
+            int layerIdx = GetVoxelLayerByZ(p.Z, frame);
+            var voxelLayer = voxel.Matrix[layerIdx];
+            int d = GetVoxelDepthAtPoint(p.X, p.Y, voxelLayer, frame);
+            vertexDepths.Add(d);
+        }
+        // 计算插点前（仅顶点）的切换点数：相邻顶点 tool 值不同的次数
+        for (int i = 0; i < vertexDepths.Count - 1; i++)
+            if (vertexDepths[i] != vertexDepths[i + 1]) switchesBefore++;
+
         for (int i = 0; i < originalPoints.Count; i++)
         {
             var cur = originalPoints[i];
@@ -218,7 +233,8 @@ public static class VoxelMapper
                 var next = originalPoints[i + 1];
                 // 仅当两点落入同一体素层时做段内 DDA 投射(原按打印层号 Layer 判定，
                 // 现按 Z 定层；跨体素层段的材料切换由顶点层变化体现)
-                if (GetVoxelLayerByZ(cur.Z, frame) == GetVoxelLayerByZ(next.Z, frame))
+                insertTransitionalPoints = true;
+                if (GetVoxelLayerByZ(cur.Z, frame) == GetVoxelLayerByZ(next.Z, frame) && insertTransitionalPoints)
                 {
                     var visits = CastRayDDA(cur, next, frame);
                     int prevDepth = curDepth;
@@ -264,6 +280,9 @@ public static class VoxelMapper
                 }
             }
         }
+        // 计算插点后（assigned 列表）的切换点数
+        for (int i = 0; i < assigned.Count - 1; i++)
+            if (assigned[i].Tool != assigned[i + 1].Tool) switchesAfter++;
         return assigned;
     }
 

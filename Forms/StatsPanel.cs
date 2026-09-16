@@ -14,7 +14,9 @@ public sealed partial class StatsPanel : UserControl
     public event Action<MoveType>? ChangeTypeRequested;
     public event Action<char, double>? CoordChangeRequested;
     public event Action? UndoRequested;
-    public event Action<bool, bool>? ColorModeChanged; // byTool, byLayer
+    public event Action<bool, bool, bool>? ColorModeChanged; // byTool, byLayer, bySpeed
+    /// <summary>采样周期 dt 变化（numdt.ValueChanged）；主窗据此重算按速度着色范围。</summary>
+    public event Action? SamplePeriodChanged;
     public event Action<bool>? ShowToolChanged;
     public event Action<bool>? ShowModifiedChanged;
     public event Action<int>? FilterLayerChanged; // -1 = 全部
@@ -35,39 +37,66 @@ public sealed partial class StatsPanel : UserControl
         _btnApplyCoord.Click += (s, e) => ApplyCoord();
         _btnUndo.Click += (s, e) => UndoRequested?.Invoke();
 
-        _cbColorTool.CheckedChanged += (s, e) => ColorModeChanged?.Invoke(_cbColorTool.Checked, _cbColorLayer.Checked);
-        _cbColorLayer.CheckedChanged += (s, e) => ColorModeChanged?.Invoke(_cbColorTool.Checked, _cbColorLayer.Checked);
+        _cbColorTool.CheckedChanged += (s, e) => ColorModeChanged?.Invoke(_cbColorTool.Checked, _cbColorLayer.Checked, _cbColorSpeed.Checked);
+        _cbColorLayer.CheckedChanged += (s, e) => ColorModeChanged?.Invoke(_cbColorTool.Checked, _cbColorLayer.Checked, _cbColorSpeed.Checked);
+        _cbColorSpeed.CheckedChanged += (s, e) => ColorModeChanged?.Invoke(_cbColorTool.Checked, _cbColorLayer.Checked, _cbColorSpeed.Checked);
+
+        // 采样周期 dt 变化：通知主窗重算按速度着色范围
+        numdt.ValueChanged += (s, e) => SamplePeriodChanged?.Invoke();
         _cbToolChange.CheckedChanged += (s, e) => ShowToolChanged?.Invoke(_cbToolChange.Checked);
         _cbModified.CheckedChanged += (s, e) => ShowModifiedChanged?.Invoke(_cbModified.Checked);
         _cbFilterLayer.CheckedChanged += (s, e) => OnFilterToggle();
         _layerTrack.Scroll += (s, e) => OnLayerTrack();
     }
 
+    /// <summary>层号 → 代表 Z（CSV 按 Z 分层时由主窗注入，用于滑块标签显示真实 Z）。null 表示按层号显示。</summary>
+    private Dictionary<int, double>? _layerZMap;
+
     private void OnFilterToggle()
     {
-        if (_cbFilterLayer.Checked) FilterLayerChanged?.Invoke(_layerTrack.Value);
-        else FilterLayerChanged?.Invoke(-1);
+        UpdateLayerLabel();
+        FilterLayerChanged?.Invoke(_cbFilterLayer.Checked ? _layerTrack.Value : -1);
     }
 
     private void OnLayerTrack()
     {
-        _lblLayer.Text = _cbFilterLayer.Checked && _layerTrack.Value >= 0
-            ? $"层: {_layerTrack.Value}" : "层: 全部";
+        UpdateLayerLabel();
         if (_cbFilterLayer.Checked) FilterLayerChanged?.Invoke(_layerTrack.Value);
     }
 
-    public void SetLayerRange(int maxLayer)
+    /// <summary>仅刷新"层: ..."标签文本（不发事件），供滑块滚动与文件载入共用。</summary>
+    private void UpdateLayerLabel()
     {
-        _layerTrack.Maximum = Math.Max(0, maxLayer);
-        if (_layerTrack.Value > _layerTrack.Maximum) _layerTrack.Value = _layerTrack.Maximum;
+        if (_cbFilterLayer.Checked && _layerTrack.Value >= 0)
+        {
+            _lblLayer.Text = (_layerZMap != null && _layerZMap.TryGetValue(_layerTrack.Value, out double z))
+                ? $"层 Z={z:0.###}"
+                : $"层: {_layerTrack.Value}";
+        }
+        else
+        {
+            _lblLayer.Text = "层: 全部";
+        }
     }
 
-    /// <summary>设置"按材料/按层着色"复选框，并触发 ColorModeChanged（供外部强制切换显示模式）。</summary>
-    public void SetColorMode(bool byTool, bool byLayer)
+    /// <summary>设置层过滤滑块范围；zMap 非 null 时（CSV 按 Z 分层）滑块标签显示真实 Z。
+    /// 本方法仅在载入新文件时调用，故一并重置层过滤（避免上一文件的 FilterLayer 残留导致新文件空白）。</summary>
+    public void SetLayerRange(int maxLayer, Dictionary<int, double>? zMap = null)
+    {
+        _layerZMap = zMap;
+        _layerTrack.Maximum = Math.Max(0, maxLayer);
+        _layerTrack.Value = -1;                 // 新文件：滑块归位
+        _cbFilterLayer.Checked = false;         // 关闭层过滤（触发 OnFilterToggle → FilterLayerChanged(-1) 重置视口）
+        UpdateLayerLabel();
+    }
+
+    /// <summary>设置"按材料/按层/按速度着色"复选框，并触发 ColorModeChanged（供外部强制切换显示模式）。</summary>
+    public void SetColorMode(bool byTool, bool byLayer, bool bySpeed)
     {
         _cbColorTool.Checked = byTool;
         _cbColorLayer.Checked = byLayer;
-        ColorModeChanged?.Invoke(byTool, byLayer);
+        _cbColorSpeed.Checked = bySpeed;
+        ColorModeChanged?.Invoke(byTool, byLayer, bySpeed);
     }
 
     private void ApplyCoord()
@@ -104,6 +133,9 @@ public sealed partial class StatsPanel : UserControl
     /// <summary>静态兜底周期（s）：ExportMovesCsv 为静态方法，无法读取实例字段 SamplePeriod，故单独提供默认值。</summary>
     private const double DefaultSamplePeriod = 0.02;
 
+    /// <summary>当前采样周期(秒)，直接读 numdt(ms)/1000。供主窗设置 Viewport3D.SpeedSamplePeriod。</summary>
+    public double SamplePeriodSeconds => (double)numdt.Value / 1000.0;
+
     /// <summary>"导出 CSV" 按钮：采样周期 dt 由面板 numdt(ms) 设置，各 G0/G1 行步长 = V × dt。</summary>
     private void OnExportCsv(object? sender, EventArgs e)
     {
@@ -124,19 +156,21 @@ public sealed partial class StatsPanel : UserControl
         public readonly string Type;        // "G0" / "G1"
         public readonly int Tool;
         public readonly double Pressure;
+        public readonly double Speed;       // 该点速度(mm/s)，继承所在段 m.Speed，写入 CSV 第7列供精确着色
         public readonly bool Structural;    // true=段终点等几何关键点，滤波不可剔除
-        public SamplePt(double x, double y, double z, string type, int tool, double pressure, bool structural)
+        public SamplePt(double x, double y, double z, string type, int tool, double pressure, double speed, bool structural)
         {
-            X = x; Y = y; Z = z; Type = type; Tool = tool; Pressure = pressure; Structural = structural;
+            X = x; Y = y; Z = z; Type = type; Tool = tool; Pressure = pressure; Speed = speed; Structural = structural;
         }
     }
 
     /// <summary>
-    /// 把 ParsedGcode 导出为 6 列点 CSV：X,Y,Z,G0/G1,T0/T1,P。
-    /// 【速度一致性】G0 与 G1 统一按本行设计速度 V 做弧长等步长采样，步长 step = V × samplePeriod
-    ///   （V 缺失或 ≤0 时退化为 DefaultStep）。段内插值点严格布在弧长 s = step, 2·step, … 处，
-    ///   相邻点距恒为 step = V·T → 以 samplePeriod 等时回放时速度恒等于设计速度 V。
-    ///   段终点（角点）始终输出以保几何；段末尾若残留一个 &lt; step 的短间隔，体现拐点减速，不再加密/抽稀。
+    /// 把 ParsedGcode 导出为 7 列点 CSV：X,Y,Z,G0/G1,T0/T1,P,Speed。末列 Speed 供按速度着色读真实速度(非点距反推)。
+    /// 【速度一致性】G0 与 G1 统一按本行设计速度 V 做弧长固定步长采样，步长 step=V×samplePeriod（V 缺失或≤0 时
+    ///   退化为 DefaultStep）。段内插值点布在 k·step 处，相邻距=step=V·T → 回放速度精确=V。
+    ///   两道优化消除反推异常速度：①段尾余数 r=L mod step —— r<半步长时并入末段(末段距≤1.5·step)，避免随机
+    ///   短间隔反推 0.5；②近零长段(L<半步长，变速/切换重合点)整段跳过，避免重点反推 0。
+    ///   最终任意相邻点距∈[0.5·step,1.5·step]，反推速度∈[0.5V,1.5V]，无 0/0.5 伪影。
     /// 【点集滤波】仅剔除与上一个保留点近乎重合（距离 &lt; DupEps）的非结构插值点
     ///   （整步命中终点造成的重复点、零长段重复点等），结构点（段终点）一律保留——即「保几何、仅清重复点」。
     /// 格式与 CsvPathReader 兼容，主窗可直接重新打开预览。返回导出点数。
@@ -154,18 +188,27 @@ public sealed partial class StatsPanel : UserControl
             if (step <= 0) step = DefaultStep;              // 防御：步长必须为正
             double L = m.SegmentLength;
 
-            // 段内等步长插值：在弧长 k·step（k=1,2,…）处布点；k·step < L - DupEps 保证最后一个插值点不与终点重合。
-            // 用整数 k 累乘 step 避免浮点累加漂移；每点距上一个保留点（段起点或上一插值点）恰为 step → 速度 = V。
-            for (int k = 1; k * step < L - DupEps; k++)
+            // 近零长段（L < 半步长，典型为变速/切换处的近重合点）：整段跳过不输出点，
+            // 避免产生点距≈0 的重点(反推 0 速)；其端点由相邻段覆盖，几何不受影响。
+            if (L < step * 0.5) continue;
+
+            // 固定步长布点：插值点在 k·step(k=1,2,…)处，相邻距=step=V·dt，回放速度精确=V。
+            int nFull = (int)Math.Floor(L / step);      // 段内完整 step 的个数
+            double r = L - nFull * step;                // 段尾余数 = L mod step
+            // 段尾余数合并：余数 < 半步长时省略最后一个插值点，把余数并入末段(末段距=step+r≤1.5·step)；
+            // 否则保留该插值点(末段距=r≥0.5·step)。从而任意相邻点距∈[0.5·step,1.5·step]→反推速度∈[0.5V,1.5V]，
+            // 既无段尾随机短间隔(伪 0.5)、也无近重点(伪 0)。用 k·step/L 算参数避免浮点累加漂移。
+            int lastK = (r < step * 0.5 && nFull >= 1) ? nFull - 1 : nFull;
+            for (int k = 1; k <= lastK; k++)
             {
-                double t = L > DupEps ? (k * step) / L : 0.0;
+                double t = (k * step) / L;
                 double x = m.PrevX + (m.X - m.PrevX) * t;
                 double y = m.PrevY + (m.Y - m.PrevY) * t;
                 double z = m.PrevZ + (m.Z - m.PrevZ) * t;
-                pts.Add(new SamplePt(x, y, z, type, m.Tool, m.Pressure, structural: false));
+                pts.Add(new SamplePt(x, y, z, type, m.Tool, m.Pressure, m.Speed, structural: false));
             }
-            // 段终点：始终输出（保几何角点），标记为结构点。
-            pts.Add(new SamplePt(m.X, m.Y, m.Z, type, m.Tool, m.Pressure, structural: true));
+            // 段终点（结构点）：始终输出以保几何角点；与上一输出点距∈[0.5·step,1.5·step]。
+            pts.Add(new SamplePt(m.X, m.Y, m.Z, type, m.Tool, m.Pressure, m.Speed, structural: true));
         }
 
         // 点集滤波：剔除与上一个保留点近重合（距离 < DupEps）的非结构插值点；结构点一律保留。
@@ -182,12 +225,13 @@ public sealed partial class StatsPanel : UserControl
             kept.Add(p);
         }
 
-        // 写文件（6 列，与 CsvPathReader 兼容）
+        // 写文件（7 列，与 CsvPathReader 兼容）：X,Y,Z,G0/G1,T0/T1,P,Speed
+        // 末列 Speed=该点速度(mm/s)，使按速度着色读真实速度而非点距反推，杜绝 0/0.5 等采样伪影。
         var lines = new List<string>(kept.Count);
         foreach (var p in kept)
             lines.Add(string.Format(CultureInfo.InvariantCulture,
-                "{0:F3},{1:F3},{2:F3},{3},{4},{5:F0}",
-                p.X, p.Y, p.Z, p.Type, "T" + p.Tool, p.Pressure));
+                "{0:F3},{1:F3},{2:F3},{3},{4},{5:F0},{6:F3}",
+                p.X, p.Y, p.Z, p.Type, "T" + p.Tool, p.Pressure, p.Speed));
 
         File.WriteAllLines(path, lines, Encoding.UTF8);
         return lines.Count;

@@ -1,0 +1,3 @@
+using GcodeViewer.Models; using GcodeViewer.Spiral;
+namespace GcodeViewer.Services;
+public sealed class SpiralGenerationService { public GenerationResult Generate(Contour contour,GenerationOptions o){var sw=System.Diagnostics.Stopwatch.StartNew(); var p=o.UseFermat?new FermatSpiralGenerator().Generate(new Point2D(contour.Points.Average(x=>x.X),contour.Points.Average(x=>x.Y)),o.Spacing,contour.Points.Max(x=>x.DistanceTo(new Point2D(contour.Points.Average(y=>y.X),contour.Points.Average(y=>y.Y))))):new SpiralPathGenerator().Generate(contour,o.Spacing);sw.Stop();return new(){Path=p,Elapsed=sw.Elapsed};} }

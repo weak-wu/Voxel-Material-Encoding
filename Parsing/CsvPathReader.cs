@@ -14,7 +14,8 @@ namespace GcodeViewer.Parsing;
 ///   第5列(T0/T1)：取数值部分作为工具号（"T1"/"1" → 1）。
 ///   第6列(气压)：double，缺失按 0。
 ///
-/// CSV 无层信息，所有 move 归入 Layer 0。
+/// CSV 无 ;LAYER 注释，解析后由 <see cref="ZLayerDetector"/> 按 Z 坐标聚类成合成层
+/// （HasLayerInfo=true、IsZLayered=true），从而支持逐层查看。
 /// </summary>
 public static class CsvPathReader
 {
@@ -24,6 +25,7 @@ public static class CsvPathReader
         return ParseText(text, path);
     }
 
+    //解析csv
     public static ParsedGcode ParseText(string text, string path)
     {
         var result = new ParsedGcode { SourcePath = path };
@@ -54,10 +56,13 @@ public static class CsvPathReader
                 !TryParseDouble(fields[2], out double z))
                 continue;
 
-            MoveType type = fields.Length > 3 ? ParseType(fields[3]) : MoveType.G1;
+            MoveType type = fields.Length > 3 ? ParseType(fields[3]) : MoveType.G1;//存在第4列(G0/G1)则解析，否则默认 G1
             int tool = fields.Length > 4 ? ParseTool(fields[4]) : 0;
             double pressure = fields.Length > 5 && TryParseDouble(fields[5], out double p) ? p : 0;
-
+            // 第7列(可选) = 速度 V(mm/s)：PathGenerator 生成的 CSV 末列 Feed 即点速度。读入后按速度着色
+            // 直接用真实速度，无需点距反推(杜绝采样网格伪影)。缺列/解析失败 → 0，着色时退化为点距/dt 反推。
+            double speed = fields.Length > 6 && TryParseDouble(fields[6], out double sp) ? sp : 0;
+            bool isFirst = moveIdx == 0;
             var move = new GcodeMove
             {
                 Index = moveIdx++,
@@ -65,9 +70,13 @@ public static class CsvPathReader
                 Layer = 0,
                 Type = type,
                 Tool = tool,
-                PrevX = curX, PrevY = curY, PrevZ = curZ,
+                // 首条 move 的 Prev 设为自身坐标
+                PrevX = isFirst ? x : curX,
+                PrevY = isFirst ? y : curY,
+                PrevZ = isFirst ? z : curZ,
                 X = x, Y = y, Z = z,
                 Pressure = pressure,
+                Speed = speed,
             };
             move.RecomputeSegmentLength();
             result.Moves.Add(move);
@@ -78,6 +87,13 @@ public static class CsvPathReader
         }
 
         FinalizeToolAndCumulative(result);
+
+        // CSV 无 ;LAYER 注释：按 Z 坐标聚类成合成层，使层列表 / 层过滤 / 按层着色均可用于 CSV，
+        // 实现逐层查看。必须在 Recompute 之前赋 move.Layer，以便统计按层聚合 LayerInfo。
+        int zLayerCount = ZLayerDetector.AssignLayers(result.Moves, result.LayerZMap);
+        result.HasLayerInfo = zLayerCount > 0;
+        result.IsZLayered = true;
+
         StatsCalculator.Recompute(result);
         return result;
     }
@@ -103,7 +119,12 @@ public static class CsvPathReader
     {
         // "0"/"G0" → G0；"1"/"G1"/其它 → G1
         var t = s.Trim().ToUpperInvariant();
-        if (t == "0" || t == "G0") return MoveType.G0;
+        if (t == "G0") return MoveType.G0;
+
+        if (double.TryParse(t, System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out double d))
+        {
+            return Math.Abs(d) < 1e-9 ? MoveType.G0 : MoveType.G1;
+        }
         return MoveType.G1;
     }
 

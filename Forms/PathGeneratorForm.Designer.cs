@@ -965,7 +965,8 @@ public sealed partial class PathGeneratorForm
         // 
         _preview.BackColor = Color.White;
         _preview.ColorByLayer = false;
-        _preview.ColorByTool = true;
+        _preview.ColorBySpeed = false;
+        _preview.ColorByTool = false;
         _preview.Dock = DockStyle.Fill;
         _preview.FilterLayer = -1;
         _preview.G0LineWidth = 2F;
@@ -977,6 +978,7 @@ public sealed partial class PathGeneratorForm
         _preview.ShowToolChange = true;
         _preview.ShowVoxel = true;
         _preview.Size = new Size(1244, 456);
+        _preview.SpeedSamplePeriod = 0.02D;
         _preview.StlMaxEdges = 24000;
         _preview.StlWireColor = Color.Silver;
         _preview.TabIndex = 0;

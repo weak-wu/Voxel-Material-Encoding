@@ -160,14 +160,17 @@ public sealed partial class PathGeneratorForm : Form
     /// <summary>按当前选择的映射方法对原始路径赋材料(Tool)值；无可用输入源时原样返回。</summary>
     private List<Point3D> ApplyMapping(List<Point3D> raw)
     {
+        int before = 0, after = 0;
         // 每种方法要求各自的输入源；源缺失时退化为不映射(沿用 gcode 内工具号)
-        return MapMethodIndex switch
+        var mapped = MapMethodIndex switch
         {
             1 => _voxelData != null ? VoxelMapper.AssignTValuesNearest(raw, _voxelData) : raw,  // 最近邻
             2 => _voxelData != null ? VoxelMapper.AssignTValuesBilinear(raw, _voxelData) : raw, // 双线性
             3 => _stlMesh != null ? VoxelMapper.AssignTValuesSdf(raw, _stlMesh) : raw,          // SDF(STL)
-            _ => _voxelData != null ? VoxelMapper.AssignTValues(raw, _voxelData) : raw,         // default = DDA
+            _ => _voxelData != null ? VoxelMapper.AssignTValues(raw, _voxelData, true, out before, out after) : raw,  // default = DDA
         };
+        int added = after - before;
+        return mapped;
     }
 
     /// <summary>重新执行映射 + 简化 + 刷新 3D 预览（切换方法/导入数据后统一调用）。原始路径为空时直接返回。</summary>
@@ -317,11 +320,13 @@ public sealed partial class PathGeneratorForm : Form
 
         // 采样周期 dt(s)：由面板 numdt(ms) 设置，与 StatsPanel 导出的 dt 统一；各材料步长 = V × dt。
         double dt = (double)_numdt.Value / 1000.0;
+        bool veloChange = _chkVelochange.Checked;//切换变速
 
         // 完整处理管线：提前偏移 → 变速区域 → 关键点插值 → 密度过滤
-        // DirectGeneratePath 参数顺序：advanceDis0(A), advanceDis1(B), velo0(A), velo1(B), vChange0/1, disChange0/1, dt
+        var advanceStats = new AdvanceStats();   // 统计限幅后的实际提前量(供回显)
         List<Point3D> processed = PathGenerator.DirectGeneratePath(
-            _originalPoints, advancedisA, advancedisB, veloA, veloB, vc0, vc1, dc0, dc1, dt, enableVeloChange: _chkVelochange.Checked);
+            _originalPoints, advancedisA, advancedisB, veloA, veloB, vc0, vc1, dc0, dc1, dt, veloChange, advanceStats);
+        string advanceActual = FmtAdvanceActual(advanceStats);
 
         // 保存（与原版一致：无表头，6 列 X,Y,Z,Extrude,Tool,Pressure）
         using SaveFileDialog sfd = new SaveFileDialog
@@ -341,7 +346,7 @@ public sealed partial class PathGeneratorForm : Form
                 // 末列 Feed 为该点速度(mm/s)：变速区域内为梯形渐变速度，其余为材料正常速度
                 lines[i] = v.X.ToString("0.000") + "," +
                            v.Y.ToString("0.000") + "," +
-                           (-1*v.Z).ToString("0.000") + "," +
+                           (-1 * v.Z).ToString("0.000") + "," +
                            v.Extrude.ToString() + "," +
                            v.Tool.ToString() + "," +
                            v.Pressure.ToString("0") + "," +
@@ -359,6 +364,7 @@ public sealed partial class PathGeneratorForm : Form
                 "\r\n原始 " + _originalPoints.Count + " 点 → 处理后 " + processed.Count + " 点" +
                 "\r\n材料 T0:" + t0 + "  T1:" + t1 +
                 "\r\n提前距离 A/B：" + advancedisA.ToString("F2") + " / " + advancedisB.ToString("F2") + " mm" +
+                advanceActual +
                 "  速度 A/B：" + veloA.ToString("F1") + " / " + veloB.ToString("F1") + " mm/s" +
                 "  步长 A/B：" + (veloA * dt).ToString("F3") + " / " + (veloB * dt).ToString("F3") + " mm  (dt=" + ((double)_numdt.Value).ToString("0") + "ms)" +
                 speedRange +
@@ -372,6 +378,23 @@ public sealed partial class PathGeneratorForm : Form
         {
             MessageBox.Show(this, "导出失败：" + ex.Message, "错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
+    }
+
+    /// <summary>回显实际提前量范围、初始段不足导致的限幅及保段长导致的前移次数。</summary>
+    private static string FmtAdvanceActual(AdvanceStats s)
+    {
+        string One(int cnt, double min, double max, int clamped, int extended)
+        {
+            if (cnt == 0) return "无切换";
+            string mn = double.IsInfinity(min) ? "—" : min.ToString("F2");
+            if (max - min > PathGenerator.PathEps) mn += "~" + max.ToString("F2");
+            var notes = new List<string>();
+            if (clamped > 0) notes.Add($"初始段不足，限幅{clamped}/{cnt}");
+            if (extended > 0) notes.Add($"保段长前移{extended}/{cnt}");
+            return mn + "(" + (notes.Count == 0 ? "未调整" : string.Join("；", notes)) + ")";
+        }
+        return "\r\n实际提前量 A/B：" + One(s.SwitchCount0, s.MinActual0, s.MaxActual0, s.ClampedCount0, s.ExtendedCount0)
+                                     + " / " + One(s.SwitchCount1, s.MinActual1, s.MaxActual1, s.ClampedCount1, s.ExtendedCount1) + " mm";
     }
 
 
@@ -494,17 +517,19 @@ public sealed partial class PathGeneratorForm : Form
             MessageBox.Show("请先导入Gcode。");
             return;
         }
+        int before = 0, after = 0;
         try
         {
             // 各映射方法：名称 + 赋值委托（与界面 ApplyMapping 同源调用）
             var methods = new (string Name, Func<List<Point3D>> Assign)[]
             {
-                ("DDA",      () => VoxelMapper.AssignTValues(_rawPoints, _voxelData!)),
+                ("DDA",      () => VoxelMapper.AssignTValues(_rawPoints, _voxelData!,true, out before, out after)),
                 ("Nearest",  () => VoxelMapper.AssignTValuesNearest(_rawPoints, _voxelData!)),
                 ("Bilinear", () => VoxelMapper.AssignTValuesBilinear(_rawPoints, _voxelData!)),
                 ("SDF",      () => VoxelMapper.AssignTValuesSdf(_rawPoints, _stlMesh)),
+                
             };
-
+          
             const int RUNS = 5;   // 运行时间取多次平均，降低单次测量抖动
             // 每方法：运行时间(ms) + 映射点集 + 精度评估报告
             var rows = new List<(string Name, List<Point3D> Points, VoxelMapAccuracyReport Rep, double Ms)>();

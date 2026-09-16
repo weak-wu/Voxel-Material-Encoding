@@ -476,7 +476,7 @@ public static class PathGenerator
 
     // ====================== G-code 生成（自 FrmPrintStep2 移植）======================
 
-    private const double PathEps = 1e-6;
+    internal const double PathEps = 1e-6;
 
     /// <summary>
     /// 构造一条 G1 指令字符串（自 FrmPrintStep2.BuildG1 移植）。
@@ -685,12 +685,20 @@ public static class PathGenerator
     /// 对路径点集施加提前出丝距离偏移（Advance Tool Offset）。
     /// 在 Tool 切换边界处提前切换材料，补偿挤出滞后。
     /// 自 AMCP.FrmPrintStep2.ApplyAdvanceToolOffset 移植，并扩展为按"切入材料"分别设置提前距离。
+    /// 后续材料段不缩短：所需提前量向前传播，仅初始段可压缩；初始段不足时限幅。
     /// </summary>
     /// <param name="points">原始路径点集（Tool 值已映射）</param>
     /// <param name="advanceDis0">切入材料 A(T0) 时所用提前出丝距离(mm)——即 B→A 切换的提前量</param>
     /// <param name="advanceDis1">切入材料 B(T1) 时所用提前出丝距离(mm)——即 A→B 切换的提前量</param>
     /// <returns>施加偏移后的点集</returns>
-    public static List<Point3D> ApplyAdvanceToolOffset(List<Point3D> points, double advanceDis0, double advanceDis1)
+    public static List<Point3D> ApplyAdvanceToolOffset(List<Point3D> points, double advanceDis0, double advanceDis1, AdvanceStats? stats = null)
+    {
+        if (points == null || points.Count == 0) return new List<Point3D>();
+        return ApplyAdvanceToolOffset(points, AdvancePlanner.Build(points, advanceDis0, advanceDis1, stats));
+    }
+
+    internal static List<Point3D> ApplyAdvanceToolOffset(List<Point3D> points,
+        List<AdvancePlanner.Transition> transitions)
     {
         var result = new List<Point3D>();
         if (points == null || points.Count == 0) return result;
@@ -709,50 +717,11 @@ public static class PathGenerator
             return result;
         }
 
-        // 2. 收集 Tool 切换事件：按"切入材料 newTool"选择对应提前距离
-        //    newTool==0(A) 用 advanceDis0；newTool==1(B) 用 advanceDis1
-        var transitions = new List<(double boundaryS, int newTool, double advanceS, double adv)>();
-        // 先收集所有 Tool 切换边界(弧长 + 切入材料)，供下方按相邻体素段长约束 advance
-        var switches = new List<(double boundaryS, int newTool)>();
-        for (int i = 0; i < n - 1; i++)
-        {
-            if (points[i].Tool != points[i + 1].Tool)
-                switches.Add((cumul[i + 1], points[i + 1].Tool));
-        }
-
-        
-        for (int i = 0; i < n - 1; i++)
-        {
-            if (points[i].Tool != points[i + 1].Tool)
-            {
-                int k = transitions.Count;              // 当前切换序号(添加前)，用于查 switches[k]
-                double boundaryS = switches[k].boundaryS;
-                int newTool = switches[k].newTool;
-                double adv = newTool == 0 ? advanceDis0 : advanceDis1;
-
-                // 前段(oldTool)/后段(newTool)长度：advance 不得大于二者，否则新材料提前出丝会挤压相邻体素
-                double prevBoundary = k > 0 ? switches[k - 1].boundaryS : 0.0;
-                double oldLen = boundaryS - prevBoundary;
-                double nextBoundary = k + 1 < switches.Count ? switches[k + 1].boundaryS : totalLen;
-                double newLen = nextBoundary - boundaryS;
-
-                // 首个切换(k==0)前为路径最前端，允许被吞(不保留)，故仅受后段(newLen)约束
-                double cap = (k == 0) ? newLen : Math.Min(oldLen, newLen);
-
-                // 静默限幅：advance 超过相邻体素段长上限时自动回缩至 cap(不抛异常)，避免挤压相邻体素
-                double advS = Math.Max(prevBoundary, boundaryS - Math.Min(adv, cap));
-                double actualAdv = boundaryS - advS;     // 实际生效提前量(≥0)
-                transitions.Add((boundaryS, newTool, advS, actualAdv));
-            }
-        }
-        transitions = transitions
-    .OrderBy(t => t.advanceS)
-    .ThenBy(t => t.boundaryS)
-    .ToList();
+        // 2. 使用统一规划的切换事件；顺序不变，压缩只传递到初始段。
         // 3. 关键弧长位置 = 原始点 + 提前点，排序去重
         var positions = new List<double>(cumul);
         foreach (var t in transitions)
-            if (t.adv > PathEps) positions.Add(t.advanceS);
+            if (t.ActualAdvance > PathEps) positions.Add(t.AdvanceS);
 
         var sorted = new List<double>();
         foreach (var s in positions.OrderBy(s => s))
@@ -792,7 +761,7 @@ public static class PathGenerator
             int tool = points[toolIdx].Tool;
             foreach (var t in transitions)
             {
-                if (s >= t.advanceS - PathEps) tool = t.newTool;
+                if (s >= t.AdvanceS - PathEps) tool = t.NewTool;
             }
             p.Tool = tool;
             result.Add(p);
@@ -820,8 +789,12 @@ public static class PathGenerator
 
             bool toolChangePrev = (cur.Tool != last.Tool);
             bool toolChangeNext = (i + 1 < points.Count) && (cur.Tool != points[i + 1].Tool);
-            if (toolChangePrev || toolChangeNext)
-                filtered[filtered.Count - 1] = cur;
+            // 丢弃折线拐点会缩短几何弧长，材料段长也随之被压缩。
+            bool isCorner = i + 1 < points.Count
+                && last.DistanceTo(cur) + cur.DistanceTo(points[i + 1])
+                    - last.DistanceTo(points[i + 1]) > PathEps * 0.01;
+            if (toolChangePrev || toolChangeNext || isCorner)
+                filtered.Add(cur); // 保留边界两侧，不能用新材料点覆盖旧材料点而提前切换。
         }
         // 确保最后一个点存在
         Point3D lastOrig = points[points.Count - 1];
@@ -852,7 +825,7 @@ public static class PathGenerator
                         Point3D fillPt = prev + walked * unitDir;
                         fillPt.Extrude = cur.Extrude;
                         fillPt.Feed = cur.Feed;
-                        fillPt.Tool = cur.Tool;
+                        fillPt.Tool = prev.Tool;
                         fillPt.Pressure = cur.Pressure;
                         result.Add(fillPt);
                     }
@@ -862,109 +835,6 @@ public static class PathGenerator
                 result.Add(cur);
         }
         return result;
-    }
-
-    /// <summary>
-    /// 直接生成路径 CSV 的完整处理管线（自 AMCP.FrmPrintStep2.btnDirectGenerateCsv_Click 移植）。
-    /// 按层处理：提前偏移 → 变速区域构建 → 关键点弧长→坐标 → 分段插值 → 密度过滤。
-    /// 扩展：打印速度与提前出丝距离均按材料 A/B 分别设置——
-    ///   材料 A = T0(Tool 0)、材料 B = T1(Tool 1)；各段步长按其所打印材料选择。
-    /// </summary>
-    /// <param name="points">映射后的路径点集</param>
-    /// <param name="advanceDis0">切入材料 A(T0) 的提前出丝距离(mm)——即 B→A 切换的提前量</param>
-    /// <param name="advanceDis1">切入材料 B(T1) 的提前出丝距离(mm)——即 A→B 切换的提前量</param>
-    /// <param name="velo0">材料 A(T0) 打印速度(mm/s)</param>
-    /// <param name="velo1">材料 B(T1) 打印速度(mm/s)</param>
-    /// <param name="vChange0">T0 切换速度(mm/s)</param>
-    /// <param name="vChange1">T1 切换速度(mm/s)</param>
-    /// <param name="disChange0">T0 切换距离(mm)</param>
-    /// <param name="disChange1">T1 切换距离(mm)</param>
-    /// <param name="dt">等时间采样周期(s，默认 0.02=50Hz)。各材料步长 = 速度 × dt，决定插值密度与密度过滤阈值。
-    ///   与 StatsPanel 的 numdt 统一：dt 越小点越密、回放速度越贴近设计速度。</param>
-    /// <returns>处理后的路径点集</returns>
-    /// <summary>
-    /// 跨越切换点的变速区域 [zStart, zEnd] 内弧长 s 处的折线渐变速度（匀速变化、全程无突变）。
-    /// 切换点 zMid(=zs) 处速度 = vc；前半 [zStart, zMid]：旧材料速度 veloOld 线性渐变到 vc；
-    /// 后半 [zMid, zEnd]：vc 线性渐变到新材料速度 veloNew。
-    /// 例：veloOld=2、vc=4、veloNew=5 → 2→4→5 单调线性过渡，切换点处恰好为 vc，与两端正常段连续。
-    /// 渐变速率由切换距离 dc(=zEnd−zStart) 与速度差共同决定——dc 越大变化越平缓。
-    /// </summary>
-    /// <param name="s">当前点弧长</param>
-    /// <param name="zStart">变速区域起点弧长（zs − dc/2，旧材料侧）</param>
-    /// <param name="zMid">切换点弧长（=zs，区域中点）</param>
-    /// <param name="zEnd">变速区域终点弧长（zs + dc/2，新材料侧）</param>
-    /// <param name="veloOld">旧材料正常速度</param>
-    /// <param name="vc">变速速度（切换点处达到）</param>
-    /// <param name="veloNew">新材料正常速度</param>
-    /// <returns>s 处的渐变速度（mm/s）</returns>
-    private static double SpeedAtBridge(double s, double zStart, double zRampEnd, double zHoldEnd, double zEnd, double veloOld, double vc, double veloNew)
-    {
-        if (s <= zRampEnd)
-        {
-            double len = zRampEnd - zStart;
-            if (len <= PathEps) return vc;
-            double t = Math.Clamp((s - zStart) / len, 0.0, 1.0);
-            return veloOld + (vc - veloOld) * t;
-        }
-
-        if (s <= zHoldEnd)
-            return vc;
-
-        double lenOut = zEnd - zHoldEnd;
-        if (lenOut <= PathEps) return vc;
-
-        double tOut = Math.Clamp((s - zHoldEnd) / lenOut, 0.0, 1.0);
-        return vc + (veloNew - vc) * tOut;
-    }
-
-    /// <summary>
-    /// 跨越切换点的变速区域内的变步长插值：沿段 [a, b]（弧长 [sA, sB]）按折线速度曲线推进。
-    /// 每步步长 = 当前弧长处的渐变速度 × dt，点距随速度匀速变化（速度快处点疏、慢处点密）。
-    /// 每个生成点的 Feed 写入该步渐变速度；Tool 按点弧长判断——切换点 zMid 前用旧材料、起用新材料。
-    /// </summary>
-    /// <param name="a">段起点（关键点）</param>
-    /// <param name="b">段终点（关键点）</param>
-    /// <param name="sA">段起点弧长</param>
-    /// <param name="sB">段终点弧长</param>
-    /// <param name="zStart/zMid/zEnd">所属变速区域起/中/终弧长</param>
-    /// <param name="veloOld/vc/veloNew">旧材料/切换/新材料速度</param>
-    /// <param name="toolOld/toolNew">旧/新材料 Tool 号</param>
-    /// <param name="dt">采样周期(s)，步长 = 速度 × dt</param>
-    /// <param name="pointsOut">输出点列表</param>
-    private static void SearchPointBridge(Point3D a, Point3D b,
-        double sA, double sB, double zStart, double zRampEnd, double zHoldEnd, double zEnd,
-        double veloOld, double vc, double veloNew, int toolOld, int toolNew,
-        double dt, List<Point3D> pointsOut)
-    {
-        double segArc = sB - sA;
-        if (segArc <= PathEps) return;
-
-        double s = sA;
-        int safety = 100000;                       // 迭代上限，防止极小步长死循环
-        while (s < sB - PathEps && safety-- > 0)
-        {
-            double v = SpeedAtBridge(s, zStart, zRampEnd, zHoldEnd, zEnd, veloOld, vc, veloNew);
-            if (double.IsNaN(v) || double.IsInfinity(v) || v <= PathEps)
-            {
-                throw new ArgumentException("变速区域内速度必须大于 0。");
-            }
-
-            double step = v * dt;
-            //if (step < PathEps) step = PathEps;    // 防止零步长卡死
-
-            double sNext = s + step;
-            if (sNext > sB - PathEps * 0.5) sNext = sB;   // 推近段末即归一，避免尾部碎点
-
-            double r = segArc > PathEps ? (sNext - sA) / segArc : 1.0;
-            r = Math.Max(0.0, Math.Min(1.0, r));
-            // 按点弧长(sNext)判 Tool：切换点(zMid)之前为旧材料，切换点及之后为新材料
-            int ptTool = toolNew; /*(sNext < zMid - PathEps) ? toolOld : toolNew;*/
-            Point3D pt = new Point3D(
-                a.X + (b.X - a.X) * r, a.Y + (b.Y - a.Y) * r, a.Z + (b.Z - a.Z) * r,
-                b.Extrude, v, b.Pressure, ptTool, b.Layer, b.GridType, b.MaterialA);
-            pointsOut.Add(pt);
-            s = sNext;
-        }
     }
 
     /// <summary>
@@ -1008,443 +878,112 @@ public static class PathGenerator
         }
         return pts;
     }
-
+    /// <summary>
+    /// 直接生成路径 CSV 的完整处理管线（自 AMCP.FrmPrintStep2.btnDirectGenerateCsv_Click 移植）。
+    /// 按层处理：提前偏移 → 变速区域构建 → 关键点弧长→坐标 → 分段插值 → 密度过滤。
+    /// 扩展：打印速度与提前出丝距离均按材料 A/B 分别设置——
+    ///   材料 A = T0(Tool 0)、材料 B = T1(Tool 1)；各段步长按其所打印材料选择。
+    ///
+    /// 解耦说明：原巨型方法已拆为 协调层(本方法) + PathLayerProcessor(单层处理) + PathGenParams(参数对象)。
+    ///   本方法仅负责 参数打包校验、按层编排、层间 Z 向过渡、Feed 兜底；
+    ///   单层内的偏移/变速区域/关键点/插值/过滤全部委托 PathLayerProcessor.ProcessLayer。
+    /// </summary>
+    /// <param name="points">映射后的路径点集</param>
+    /// <param name="advanceDis0">切入材料 A(T0) 的提前出丝距离(mm)——即 B→A 切换的提前量</param>
+    /// <param name="advanceDis1">切入材料 B(T1) 的提前出丝距离(mm)——即 A→B 切换的提前量</param>
+    /// <param name="velo0">材料 A(T0) 打印速度(mm/s)</param>
+    /// <param name="velo1">材料 B(T1) 打印速度(mm/s)</param>
+    /// <param name="vChange0">T0 切换速度(mm/s)</param>
+    /// <param name="vChange1">T1 切换速度(mm/s)</param>
+    /// <param name="disChange0">T0 变速距离(mm)</param>
+    /// <param name="disChange1">T1 变速距离(mm)</param>
+    /// <param name="dt">等时间采样周期(s，默认 0.02=50Hz)。各材料步长 = 速度 × dt，决定插值密度与密度过滤阈值。
+    ///   与 StatsPanel 的 numdt 统一：dt 越小点越密、回放速度越贴近设计速度。</param>
+    /// <param name="enableVeloChange">是否启用跨越切换点的变速规则。</param>
+    /// <returns>处理后的路径点集</returns>
     public static List<Point3D> DirectGeneratePath(List<Point3D> points,
+        double advanceDis0, double advanceDis1, double velo0, double velo1,
+        double vChange0, double vChange1, double disChange0, double disChange1,
+        double dt = 0.02, bool enableVeloChange = false, AdvanceStats? stats = null)
+    {
+        // 1) 工艺参数打包 + 合法性校验(原入口校验段搬入 PathGenParams.Validate)
+        var p = new PathGenParams
+        {
+            AdvanceDis0 = advanceDis0,
+            AdvanceDis1 = advanceDis1,
+            Velo0 = velo0,
+            Velo1 = velo1,
+            VChange0 = vChange0,
+            VChange1 = vChange1,
+            DisChange0 = disChange0,
+            DisChange1 = disChange1,
+            Dt = dt,
+            EnableVeloChange = enableVeloChange,
+        };
+        p.Validate();
+
+        // 2) 空集短路
+        var result = new List<Point3D>();
+        if (points == null || points.Count == 0) return result;
+
+        // 3) 按层处理：单层逻辑全部委托 PathLayerProcessor，本方法只做层间衔接
+        int layerCount = points.Max(pt => pt.Layer) + 1;
+        Point3D? prevLast = null;   // 上一非空层末点，用于层间 Z 向过渡段衔接
+        for (int layerIdx = 0; layerIdx < layerCount; layerIdx++)
+        {
+            List<Point3D> pointsInLayer = points.Where(pt => pt.Layer == layerIdx).ToList();
+            if (pointsInLayer.Count == 0) continue;
+            
+            //处理单层
+            List<Point3D> layerOut = PathLayerProcessor.ProcessLayer(pointsInLayer, p, stats);
+            //处理层间过渡
+            AppendLayerTransition(result, ref prevLast, layerOut, p);
+        }
+
+        // 4) Feed 兜底
+        FinalizeFeed(result, p);
+        return result;
+    }
+
+    /// <summary>
+    /// 将单层输出接入总结果：先补"上一层末点 → 本层首点"的 Z 向过渡段(按 step=vz×dt 补中间点、Feed=vz)，
+    /// 再追加本层点，并更新 prevLast 为本层末点供下一层衔接。首层 prevLast 为 null 不补过渡。
+    /// vz 取下一段(本层首点)所属材料的正常打印速度，与正常段保持一致。
+    /// </summary>
+    private static void AppendLayerTransition(List<Point3D> result, ref Point3D? prevLast,
+        List<Point3D> layerOut, PathGenParams p)
+    {
+        if (layerOut.Count == 0) return;
+        if (prevLast != null)
+        {
+            int nextTool = layerOut[0].Tool;
+            double vz = (nextTool == 0) ? p.Velo0 : p.Velo1;   // 沿用下一段(本层首点)材料速度
+            result.AddRange(InterpolateLayerTransition(prevLast, layerOut[0], vz, p.Dt));
+        }
+        result.AddRange(layerOut);
+        prevLast = layerOut[^1];
+    }
+
+    /// <summary>
+    /// Feed 兜底：变速区域点的 Feed 已在梯形插值时写入渐变速度，正常段点已写入材料正常速度；
+    /// 此处仅对极少数未经过插值流程的点(如路径过短直通点)按材料正常速度补齐。
+    /// </summary>
+    private static void FinalizeFeed(List<Point3D> result, PathGenParams p)
+    {
+        foreach (var pt in result)
+            if (pt.Feed <= PathEps)
+                pt.Feed = (pt.Tool == 0) ? p.Velo0 : p.Velo1;
+    }
+
+
+    public static List<Point3D> AdvanceToolOffset(List<Point3D> points,
         double advanceDis0, double advanceDis1, double velo0, double velo1,
         double vChange0, double vChange1, double disChange0, double disChange1,
         double dt = 0.02, bool enableVeloChange = false)
     {
-        if (dt <= 0) dt = 0.02; // 防御：采样周期必须为正
-        //参数检查
-        if (dt <= PathEps)
-            throw new ArgumentException("dt 必须大于 0。");
-
-        if (velo0 <= PathEps || velo1 <= PathEps)
-            throw new ArgumentException("材料正常速度必须大于 0。");
-
-        if (advanceDis0 < 0 || advanceDis1 < 0 ||
-            disChange0 < 0 || disChange1 < 0)
-            throw new ArgumentException("距离参数不能为负数。");
-        // 注：T0/T1 变速速度的合法性由 SearchPointBridge 内 v<=PathEps 时抛出兜底，此处不重复校验
-        var result = new List<Point3D>();
-        if (points == null || points.Count == 0) return result;
-        if (!enableVeloChange)
-        {
-            disChange0 = 0;
-            disChange1 = 0;
-        }
-        // 各材料步长 = 速度 × dt：步长决定插值密度与密度过滤阈值
-        double movestep0 = velo0 * dt; // 材料 A(T0)
-        double movestep1 = velo1 * dt; // 材料 B(T1)
-
-        // 按所打印材料选择步长：Tool 0→A 步长，Tool 1→B 步长
-        double StepOfTool(int tool) => tool == 0 ? movestep0 : movestep1;
-
-        int layerCount = points.Max(p => p.Layer) + 1;
-
-        // 上一非空层的末点：用于层间 Z 向过渡段（喷头抬升/下降）的速度插值衔接
-        Point3D? prevLast = null;
-
-        // 将单层输出接入总结果：先补"上一层末点 → 本层首点"的 Z 向过渡段（按 step=vz×dt 补中间点、
-        // Feed=vz），再追加本层点，并更新 prevLast 为本层末点供下一层衔接。首层 prevLast 为 null 不补过渡。
-        // vz 取下一段（本层首点）所属材料的正常打印速度，与正常段保持一致。
-        void AppendLayer(List<Point3D> layerOut)
-        {
-            if (layerOut.Count == 0) return;
-            if (prevLast != null)
-            {
-                int nextTool = layerOut[0].Tool;
-                double vz = (nextTool == 0) ? velo0 : velo1;   // 沿用下一段（本层首点）材料速度
-                result.AddRange(InterpolateLayerTransition(prevLast, layerOut[0], vz, dt));
-            }
-            result.AddRange(layerOut);
-            prevLast = layerOut[^1];
-        }
-
-        for (int layerIdx = 0; layerIdx < layerCount; layerIdx++)
-        {
-            List<Point3D> pointsInLayer = points.Where(p => p.Layer == layerIdx).ToList();
-            if (pointsInLayer.Count == 0) continue;
-
-            // 1) 应用提前距离 Tool 偏移（A/B 各自提前量）
-            List<Point3D> offsetPoints = ApplyAdvanceToolOffset(pointsInLayer, advanceDis0, advanceDis1);
-            if (offsetPoints.Count < 2) { AppendLayer(offsetPoints); continue; }
-
-            int nOff = offsetPoints.Count;
-
-            // 2a) 累计弧长
-            double[] cumulOff = new double[nOff];
-            cumulOff[0] = 0;
-            for (int i = 1; i < nOff; i++)
-                cumulOff[i] = cumulOff[i - 1] + offsetPoints[i].DistanceTo(offsetPoints[i - 1]);
-            double totalOffArc = cumulOff[nOff - 1];
-
-            // 2b) 变速区域：跨越切换点 zs 的 [zs−dc/2, zs+dc/2] 范围内速度按折线渐变
-            //     前半 veloOld→vc、后半 vc→veloNew，切换点处速度=vc，两端与相邻正常段连续、全程无突变
-            var sourceCumul = new double[pointsInLayer.Count];
-            sourceCumul[0] = 0.0;
-
-            for (int i = 1; i < pointsInLayer.Count; i++)
-            {
-                sourceCumul[i] =
-                    sourceCumul[i - 1] +
-                    pointsInLayer[i].DistanceTo(pointsInLayer[i - 1]);
-            }
-            // 预先收集所有切换边界弧长，供下方对 advance 做与 ApplyAdvanceToolOffset 一致的静默限幅
-            var switchBounds = new List<double>();
-            for (int i = 1; i < pointsInLayer.Count; i++)
-            {
-                if (pointsInLayer[i].Tool != pointsInLayer[i - 1].Tool)
-                    switchBounds.Add(sourceCumul[i]);
-            }
-            int switchIdx = 0;
-            var zones = new List<(double zStart, double zRampEnd, double zHoldEnd, double zEnd,
-                                    double veloOld, double vc, double veloNew, int toolOld, int toolNew)>();
-            for (int i = 1; i < pointsInLayer.Count; i++)
-            {
-                if (pointsInLayer[i].Tool == pointsInLayer[i - 1].Tool)
-                    continue;
-
-                int toolOld = pointsInLayer[i - 1].Tool;
-                int toolNew = pointsInLayer[i].Tool;
-
-                double boundaryS = sourceCumul[i];
-
-                double advance = toolNew == 0
-                    ? advanceDis0
-                    : advanceDis1;
-
-                // 与 ApplyAdvanceToolOffset 完全一致的实际生效提前量(静默限幅)：
-                //   cap = (首个切换 ? newLen : min(oldLen,newLen))；advS=实际提前切换点；actualAdv=生效提前量
-                int k = switchIdx;
-                switchIdx++;                       // 无论下方是否 continue，序号都已推进
-                double prevBoundary = k > 0 ? switchBounds[k - 1] : 0.0;
-                double oldLen = boundaryS - prevBoundary;
-                double nextBoundary = k + 1 < switchBounds.Count ? switchBounds[k + 1] : sourceCumul[^1];
-                double newLen = nextBoundary - boundaryS;
-                double cap = (k == 0) ? newLen : Math.Min(oldLen, newLen);
-                double advS = Math.Max(prevBoundary, boundaryS - Math.Min(advance, cap));
-                double actualAdv = boundaryS - advS;
-                double switchS = advS;
-
-                double requestedChange = toolNew == 0
-                    ? disChange0
-                    : disChange1;
-
-                // 变速区必须位于实际提前点 advS 与原始切换点 boundaryS 之间，可用长度=actualAdv(已限幅)
-                double available = actualAdv;
-                double changeLength = Math.Min(requestedChange, available);
-
-                if (changeLength <= PathEps)
-                    continue;
-
-                // 速度变化结束于原始切换点 B
-                double zStart = boundaryS - changeLength;//变速开始
-                double zEnd = boundaryS;//原始切换点
-                //double zStart = boundaryS - changeLength;
-               // double zMid = (zStart + zEnd) * 0.5;
-                
-               
-                double rampLength = changeLength * 0.15;
-                double zRampEnd = zStart + rampLength;//到达切换速度
-             
-                double zHoldEnd = zEnd - rampLength;//保持切换速度结束
-                double veloOld = toolOld == 0 ? velo0 : velo1;
-                double veloNew = toolNew == 0 ? velo0 : velo1;
-                double vc = toolNew == 0 ? vChange0 : vChange1;
-
-                zones.Add((
-                    zStart,
-                    zRampEnd,         
-                    zHoldEnd,
-                    zEnd,
-                    veloOld,
-                    vc,
-                    veloNew,
-                    toolOld,
-                    toolNew));
-            }
-            //if (advanceDis0 > PathEps || advanceDis1 > PathEps)
-            //{
-            //    for (int i = 1; i < nOff; i++)
-            //    {
-            //        if (offsetPoints[i].Tool != offsetPoints[i - 1].Tool)
-            //        {
-            //            int nt = offsetPoints[i].Tool;          // 新材料
-            //            int ot = offsetPoints[i - 1].Tool;      // 旧材料
-            //            double vc = (nt == 0) ? vChange0 : vChange1;
-            //            double dc = (nt == 0) ? disChange0 : disChange1;
-            //            double veloNew = (nt == 0) ? velo0 : velo1;
-            //            double veloOld = (ot == 0) ? velo0 : velo1;
-            //            // 变速距离不超过该材料对应的提前出丝距离
-            //            dc = Math.Min(dc, (nt == 0) ? advanceDis0 : advanceDis1);
-            //            if (dc < PathEps) continue;
-            //            double zs = cumulOff[i];                // 切换点 = 变速区域中点 zMid
-            //            double half = dc * 0.5;
-            //            double zStart = Math.Max(0.0, zs - half);
-            //            double zEnd = Math.Min(totalOffArc, zs + half);
-            //            zones.Add((zStart, zs, zEnd, veloOld, vc, veloNew, ot, nt));
-            //        }
-            //    }
-            //}
-            //新增
-
-            zones = zones.OrderBy(z => z.zStart).ToList();
-
-            for (int i = 1; i < zones.Count; i++)
-            {
-                if (zones[i].zStart < zones[i - 1].zEnd - PathEps)
-                {
-                    throw new ArgumentException(
-                        "变速区域发生重叠，请减小提前距离或变速距离。");
-                }
-            }
-            // 2c) 关键弧长位置（原始顶点 + 变速区域两端；切换点 zMid 已作为原始顶点在上方加入）
-            var keyArcs = new List<(double arc, bool isToolSwitch, int toolVal)>();
-            for (int i = 0; i < nOff; i++)
-            {
-                bool sw = (i > 0 && offsetPoints[i].Tool != offsetPoints[i - 1].Tool);
-                keyArcs.Add((cumulOff[i], sw, offsetPoints[i].Tool));
-            }
-            foreach (var z in zones)
-            {
-                if (z.zStart > PathEps && z.zStart < totalOffArc - PathEps)
-                {
-                    // 这里已经提前切换，所以使用新 Tool
-                    keyArcs.Add((z.zStart, false, z.toolNew));
-                    keyArcs.Add((z.zRampEnd, false, z.toolNew));
-                    keyArcs.Add((z.zHoldEnd, false, z.toolNew));
-                }
-                if (z.zEnd > PathEps && z.zEnd < totalOffArc - PathEps)
-                {
-                    // 保留原始切换点 B
-                    keyArcs.Add((z.zEnd, false, z.toolNew));
-                }
-            }
-            // 排序去重
-            keyArcs.Sort((a, b) => a.arc.CompareTo(b.arc));
-            var uniqueArcs = new List<(double arc, bool isToolSwitch, int toolVal)>();
-            foreach (var ka in keyArcs)
-            {
-                if (uniqueArcs.Count == 0 || ka.arc - uniqueArcs[uniqueArcs.Count - 1].arc > PathEps * 0.5)
-                    uniqueArcs.Add(ka);
-                else
-                {
-                    var last = uniqueArcs[uniqueArcs.Count - 1];
-                    uniqueArcs[uniqueArcs.Count - 1] = (last.arc, last.isToolSwitch || ka.isToolSwitch, ka.toolVal);
-                }
-            }
-
-            // 2d) 关键弧长 → 关键点坐标（线性插值）
-            var keyPts = new List<Point3D>();
-            var keyIsSw = new List<bool>();
-            foreach (var (arc, isSw, tool) in uniqueArcs)
-            {
-                Point3D pt;
-                if (arc <= PathEps)
-                    pt = ClonePoint(offsetPoints[0]);
-                else if (arc >= totalOffArc - PathEps)
-                    pt = ClonePoint(offsetPoints[nOff - 1]);
-                else
-                {
-                    int seg = 1;
-                    while (seg < cumulOff.Length && cumulOff[seg] < arc - PathEps) seg++;
-                    if (seg >= cumulOff.Length) seg = cumulOff.Length - 1;
-                    double s0 = cumulOff[seg - 1], s1 = cumulOff[seg];
-                    double r = (s1 - s0 > PathEps) ? (arc - s0) / (s1 - s0) : 0;
-                    r = Math.Max(0, Math.Min(1, r));
-                    Point3D a = offsetPoints[seg - 1], b = offsetPoints[seg];
-                    pt = new Point3D(
-                        a.X + (b.X - a.X) * r, a.Y + (b.Y - a.Y) * r, a.Z + (b.Z - a.Z) * r,
-                        b.Extrude, b.Feed, b.Pressure, tool, b.Layer, b.GridType, b.MaterialA);
-                }
-                keyPts.Add(pt);
-                keyIsSw.Add(isSw);
-            }
-
-            // 2e) 重新计算关键点累计弧长
-            int kN = keyPts.Count;
-            double[] kCumul = new double[kN];
-            kCumul[0] = 0;
-            for (int i = 1; i < kN; i++)
-                kCumul[i] = kCumul[i - 1] + keyPts[i].DistanceTo(keyPts[i - 1]);
-
-            // 2f) 确定每段步长与是否在变速区域内：变速区域内实际按折线渐变步长插值（见 2g），
-            //     此处 segSteps 仅作参考（变速区域用 vc*dt 标记，供 switchRegionMap 记录）
-            double[] segSteps = new double[kN - 1];
-            bool[] segInZone = new bool[kN - 1];
-            for (int i = 0; i < kN - 1; i++)
-            {
-                // 段 [i,i+1] 所打印材料取段起点工具
-                int segTool = keyPts[i].Tool;
-                segSteps[i] = (segTool == 0) ? movestep0 : movestep1;
-                segInZone[i] = false;
-                double s = kCumul[i];
-                foreach (var z in zones)
-                {
-                    if (s >= z.zStart - PathEps && s < z.zEnd - PathEps)
-                    { segSteps[i] = z.vc * dt; segInZone[i] = true; break; }
-                }
-            }
-
-            // 2g) 逐段插值：变速区域段（含其中的切换边界段）按折线变步长（速度匀变），其余段恒定步长
-            var switchRegionMap = new List<(int startIdx, int endIdx, double switchStep)>();
-            double rem = 0.0;
-            var layerInterpolated = new List<Point3D>();
-            int swRegStart = -1;
-            double swRegStep = 0;
-
-            for (int i = 0; i < kN - 1; i++)
-            {
-                bool isBoundary = keyIsSw[i + 1];
-                double step = segSteps[i];
-                bool inZone = segInZone[i];
-                int before = layerInterpolated.Count;
-
-                if (inZone && swRegStart < 0) { swRegStart = before; swRegStep = step; }
-                if (!inZone && swRegStart >= 0)
-                {
-                    switchRegionMap.Add((swRegStart, before, swRegStep));
-                    swRegStart = -1;
-                }
-
-                // 查找本段所属变速区域（inZone 时），取出折线参数与新旧材料
-                double zStart = 0, zRampEnd = 0, zHoldEnd = 0, zEnd = 0, zVeloOld = 0, zVc = 0, zVeloNew = 0;
-                int zToolOld = keyPts[i].Tool, zToolNew = keyPts[i + 1].Tool;
-                bool hasZone = false;
-                if (inZone)
-                {
-                    foreach (var z in zones)
-                    {
-                        if (kCumul[i] >= z.zStart - PathEps && kCumul[i] < z.zEnd - PathEps)
-                        {
-                            zStart = z.zStart; zRampEnd = z.zRampEnd; zHoldEnd = z.zHoldEnd; zEnd = z.zEnd;
-                            zVeloOld = z.veloOld; zVc = z.vc; zVeloNew = z.veloNew;
-                            zToolOld = z.toolOld; zToolNew = z.toolNew;
-                            hasZone = true; break;
-                        }
-                    }
-                }
-
-                if (inZone && hasZone)
-                {
-                    // 变速区域段（含切换边界段）：折线变步长插值，veloOld→vc→veloNew 匀速渐变；
-                    // Feed=渐变速度，Tool 在 SearchPointBridge 内按弧长于切换点前后切换；
-                    // 切换点由变步长精确推进至段端点生成，无需额外插入 boundary
-                    SearchPointBridge(keyPts[i], keyPts[i + 1], kCumul[i], kCumul[i + 1],
-                        zStart, zRampEnd, zHoldEnd, zEnd, zVeloOld, zVc, zVeloNew, zToolOld, zToolNew, dt, layerInterpolated);
-                    rem = 0.0;   // 变速区域独立步进，余量重置
-                }
-                else if (isBoundary)
-                {
-                    // 非变速区域的 Tool 切换边界：恒定步长插值 + 精确插入切换点（新 Tool 值）
-                    SearchPoint(keyPts[i], keyPts[i + 1], step, ref rem, layerInterpolated);
-                    int toolForInterp = keyPts[i].Tool;
-                    for (int j = before; j < layerInterpolated.Count; j++)
-                    {
-                        layerInterpolated[j].Tool = toolForInterp;
-                        layerInterpolated[j].Feed = (toolForInterp == 0) ? velo0 : velo1;
-                    }
-                    Point3D boundary = ClonePoint(keyPts[i + 1]);
-                    boundary.Feed = (boundary.Tool == 0) ? velo0 : velo1;
-                    if (layerInterpolated.Count > 0
-                        && layerInterpolated[layerInterpolated.Count - 1].DistanceTo(boundary) < step * 0.5)
-                        layerInterpolated[layerInterpolated.Count - 1] = boundary;
-                    else
-                        layerInterpolated.Add(boundary);
-                    rem = 0.0;
-                }
-                else
-                {
-                    // 正常段：恒定步长，Feed=材料正常速度
-                    SearchPoint(keyPts[i], keyPts[i + 1], step, ref rem, layerInterpolated);
-                    for (int j = before; j < layerInterpolated.Count; j++)
-                        layerInterpolated[j].Feed = (layerInterpolated[j].Tool == 0) ? velo0 : velo1;
-                    // 变速→正常过渡处（zone end）重置余量
-                    bool atZoneEnd = false;
-                    foreach (var z in zones)
-                    { if (Math.Abs(kCumul[i + 1] - z.zEnd) < PathEps) { atZoneEnd = true; break; } }
-                    if (atZoneEnd) rem = 0.0;
-                }
-            }
-            if (swRegStart >= 0)
-                switchRegionMap.Add((swRegStart, layerInterpolated.Count, swRegStep));
-
-            // 补上最后一个关键点
-            Point3D lastKey = keyPts[kN - 1];
-            if (layerInterpolated.Count == 0
-                || layerInterpolated[layerInterpolated.Count - 1].DistanceTo(lastKey) > PathEps)
-                layerInterpolated.Add(lastKey);
-
-            // 2h) 分区域密度过滤
-            List<Point3D> filtered;
-            if (switchRegionMap.Count > 0)
-            {
-                int totalPts = layerInterpolated.Count;
-                filtered = new List<Point3D>();
-                var sortedRegions = switchRegionMap.OrderBy(r => r.startIdx).ToList();
-
-                int segStart = 0;
-                foreach (var region in sortedRegions)
-                {
-                    int regionStart = Math.Max(0, region.startIdx);
-                    int regionEnd = Math.Min(region.endIdx, totalPts);
-
-                    // 正常区域段 [segStart, regionStart)：按其所打印材料选择步长
-                    if (regionStart > segStart)
-                    {
-                        var normalSeg = layerInterpolated.Skip(segStart).Take(regionStart - segStart).ToList();
-                        int nTool = normalSeg.Count > 0 ? normalSeg[0].Tool : 0;
-                        double ns = StepOfTool(nTool);
-                        filtered.AddRange(FilterDensePoints(normalSeg, ns * 0.8, ns * 1.2));
-                    }
-                    // 变速区域段 [regionStart, regionEnd)：已按梯形渐变步长精确生成，
-                    // 跳过密度过滤以保留速度渐变对应的渐变点密度
-                    var switchSeg = layerInterpolated.Skip(regionStart).Take(regionEnd - regionStart).ToList();
-                    if (switchSeg.Count > 0 && regionStart < totalPts)
-                    {
-                        if (switchSeg[0].DistanceTo(layerInterpolated[regionStart]) > PathEps)
-                            switchSeg.Insert(0, ClonePoint(layerInterpolated[regionStart]));
-                    }
-                    filtered.AddRange(switchSeg);
-                    segStart = regionEnd;
-                }
-                // 尾部正常区域
-                if (totalPts > segStart)
-                {
-                    var tailSeg = layerInterpolated.Skip(segStart).Take(totalPts - segStart).ToList();
-                    int nTool = tailSeg.Count > 0 ? tailSeg[0].Tool : 0;
-                    double ns = StepOfTool(nTool);
-                    filtered.AddRange(FilterDensePoints(tailSeg, ns * 0.8, ns * 1.2));
-                }
-            }
-            else
-            {
-                // 无变速区域：按 Tool 连续段分组，各用其材料步长过滤
-                filtered = new List<Point3D>();
-                int runStart = 0;
-                for (int i = 1; i <= layerInterpolated.Count; i++)
-                {
-                    bool breakRun = i == layerInterpolated.Count
-                                 || layerInterpolated[i].Tool != layerInterpolated[runStart].Tool;
-                    if (!breakRun) continue;
-
-                    var run = layerInterpolated.Skip(runStart).Take(i - runStart).ToList();
-                    double ns = StepOfTool(run.Count > 0 ? run[0].Tool : 0);
-                    filtered.AddRange(FilterDensePoints(run, ns * 0.8, ns * 1.2));
-                    runStart = i;
-                }
-            }
-
-            AppendLayer(filtered);
-        }
-
-        // Feed 兜底：变速区域点的 Feed 已在梯形插值时写入渐变速度，正常段点已写入材料正常速度；
-        //           此处仅对极少数未经过插值流程的点（如路径过短直通点）按材料正常速度补齐
-        foreach (var p in result)
-            if (p.Feed <= PathEps)
-                p.Feed = (p.Tool == 0) ? velo0 : velo1;
+        List<Point3D> result = new List<Point3D>();
 
         return result;
     }
+
 }

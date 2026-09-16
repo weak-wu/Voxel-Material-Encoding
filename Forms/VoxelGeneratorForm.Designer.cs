@@ -132,7 +132,7 @@ public sealed partial class VoxelGeneratorForm
 
         // _preview
         _preview.BackColor = Color.White;
-        _preview.ColorByTool = true;
+        _preview.ColorByTool = false;
         _preview.Dock = DockStyle.Fill;
         _preview.Name = "_preview";
         _preview.ShowStl = true;

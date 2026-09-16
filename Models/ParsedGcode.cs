@@ -12,6 +12,13 @@ public sealed class ParsedGcode
     /// <summary>源文件是否含 ;LAYER 注释（层信息）。false 时无法按层识别，应退化为按材料(T0/T1)显示。</summary>
     public bool HasLayerInfo { get; set; }
 
+    /// <summary>层是否由 Z 聚类合成（典型为 CSV 路径，无 ;LAYER 注释）。true 时层列表/过滤用 Z 值标识层。</summary>
+    public bool IsZLayered { get; set; }
+
+    /// <summary>层号 → 代表 Z（层锚点 Z）。CSV 按 Z 分层时由 ZLayerDetector 填充；G-code 为空。
+    /// 供层列表/层过滤滑块显示真实 Z，以及 StatsCalculator 写入 LayerInfo.Z。</summary>
+    public Dictionary<int, double> LayerZMap { get; } = new();
+
     public bool IsEmpty => Moves.Count == 0;
 
     /// <summary>根据源文件行号查找对应 move（行号→move 二分/线性映射）。</summary>

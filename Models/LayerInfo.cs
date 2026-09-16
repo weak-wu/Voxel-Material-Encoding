@@ -4,6 +4,8 @@ namespace GcodeViewer.Models;
 public sealed class LayerInfo
 {
     public int Layer { get; set; }
+    /// <summary>该层的代表 Z 高度（mm）。CSV 按 Z 分层时为层锚点 Z；G-code（无 Z 映射）取该层首条 move 的 Z。</summary>
+    public double Z { get; set; }
     public int StartLine { get; set; }
     public int EndLine { get; set; }
     public double G0Length { get; set; }

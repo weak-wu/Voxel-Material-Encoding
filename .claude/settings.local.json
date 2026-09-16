@@ -1,9 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(dotnet build *)",
-      "Read(//w/Claude_Talk/_smoketest/**)",
-      "Bash(dotnet run *)"
-    ]
-  }
-}
